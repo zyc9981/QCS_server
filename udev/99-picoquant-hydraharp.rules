@@ -1,0 +1,2 @@
+# HydraHarp 400 USB 3.0 (0e0d:0009): allow members of dialout to open it.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0e0d", ATTR{idProduct}=="0009", GROUP="dialout", MODE="0660"

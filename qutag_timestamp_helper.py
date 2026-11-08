@@ -214,8 +214,11 @@ def open_qutag_timestamp_window(app):
 
     app.qutag_timestamp_win = Toplevel(app.tx_win)
     app.qutag_timestamp_win.title("Time Stamps")
-    app.qutag_timestamp_win.geometry("1000x880")
-    app.qutag_timestamp_win.minsize(900, 820)
+    # Keep the two plot windows aligned across the top, with acquisition controls below the left plot.
+    screen_width = app.qutag_timestamp_win.winfo_screenwidth()
+    screen_height = app.qutag_timestamp_win.winfo_screenheight()
+    app.qutag_timestamp_win.geometry(f"{screen_width}x{screen_height}+0+0")
+    app.qutag_timestamp_win.minsize(1100, 700)
     _style_window(app, app.qutag_timestamp_win)
     app.qutag_timestamp_writing = False
     app.qutag_timestamp_preparing_hydraharp = False
@@ -301,10 +304,22 @@ def open_qutag_timestamp_window(app):
     app.qutag_timestamp_trigger_count = 0
     app.time_tagger_file_writer = None
 
-    plot_frame = _frame(app, app.qutag_timestamp_win, surface=True)
-    plot_frame.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+    content = _frame(app, app.qutag_timestamp_win)
+    content.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+    content.grid_columnconfigure(0, weight=1, uniform="timestamp_layout")
+    content.grid_columnconfigure(1, weight=1, uniform="timestamp_layout")
+    content.grid_rowconfigure(0, weight=1, uniform="timestamp_rows")
+    content.grid_rowconfigure(1, weight=1, uniform="timestamp_rows")
+    count_plot_frame = _frame(app, content, surface=True)
+    count_plot_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+    placeholder_plot_frame = _frame(app, content, surface=True)
+    placeholder_plot_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+    controls_panel = _frame(app, content, surface=True)
+    controls_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+    controls_panel.grid_columnconfigure(0, weight=1)
+    _frame(app, content).grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
-    figure = Figure(figsize=(8.0, 3.8), dpi=100)
+    figure = Figure(figsize=(4.8, 2.7), dpi=100)
     axis = figure.add_subplot(111)
     _style_plot(app, figure, axis)
     axis.set_title(
@@ -326,15 +341,35 @@ def open_qutag_timestamp_window(app):
     _style_legend(app, legend)
     figure.subplots_adjust(left=0.08, right=0.985, bottom=0.12, top=0.92)
 
-    app.qutag_timestamp_canvas = FigureCanvasTkAgg(figure, master=plot_frame)
+    app.qutag_timestamp_canvas = FigureCanvasTkAgg(figure, master=count_plot_frame)
     app.qutag_timestamp_canvas.get_tk_widget().configure(
         bg=_ui(app)["surface"],
         highlightthickness=0,
     )
     app.qutag_timestamp_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
 
-    file_frame = _frame(app, app.qutag_timestamp_win)
-    file_frame.pack(fill="x", padx=10, pady=6)
+    placeholder_figure = Figure(figsize=(4.8, 2.7), dpi=100)
+    placeholder_axis = placeholder_figure.add_subplot(111)
+    _style_plot(app, placeholder_figure, placeholder_axis)
+    placeholder_axis.set_title("Plot")
+    placeholder_axis.set_xlabel("Time (s)")
+    placeholder_axis.set_ylabel("Counts")
+    placeholder_axis.set_xlim(0, app.qutag_timestamp_plot_window_s)
+    placeholder_axis.set_ylim(0, 4096)
+    placeholder_figure.subplots_adjust(left=0.08, right=0.985, bottom=0.12, top=0.92)
+    app.qutag_timestamp_placeholder_axis = placeholder_axis
+    app.qutag_timestamp_placeholder_canvas = FigureCanvasTkAgg(
+        placeholder_figure, master=placeholder_plot_frame
+    )
+    app.qutag_timestamp_placeholder_canvas.get_tk_widget().configure(
+        bg=_ui(app)["surface"], highlightthickness=0
+    )
+    app.qutag_timestamp_placeholder_canvas.get_tk_widget().pack(
+        fill="both", expand=True, padx=8, pady=8
+    )
+
+    file_frame = _frame(app, controls_panel)
+    file_frame.pack(fill="x", padx=10, pady=(10, 6))
 
     _label(app, file_frame, text="File:").pack(side="left")
     # FileWriter stores losslessly compressed Time Tagger data in .ttbin files.
@@ -349,7 +384,7 @@ def open_qutag_timestamp_window(app):
     )
     _button(app, file_frame, text="Browse", command=lambda: _browse_timestamp_file(app)).pack(side="left")
 
-    format_frame = _frame(app, app.qutag_timestamp_win)
+    format_frame = _frame(app, controls_panel)
     format_frame.pack(fill="x", padx=10, pady=(0, 6))
     _label(
         app,
@@ -358,19 +393,19 @@ def open_qutag_timestamp_window(app):
         fg=_ui(app)["muted"],
     ).pack(side="left")
 
-    qsfp_frame = _frame(app, app.qutag_timestamp_win)
+    qsfp_frame = _frame(app, controls_panel)
     qsfp_frame.pack(fill="x", padx=10, pady=(0, 6))
     modes = get_qsfp_modes(app)
     app.qutag_timestamp_qsfp_var = modes.enabled
     app.qutag_timestamp_qsfp_checkbox = modes.add_panel(qsfp_frame)
-    qsfp_status_frame = _frame(app, app.qutag_timestamp_win)
+    qsfp_status_frame = _frame(app, controls_panel)
     qsfp_status_frame.pack(fill="x", padx=10, pady=(0, 6))
     _label(
         app, qsfp_status_frame, textvariable=modes.status,
         fg=_ui(app)["muted"],
     ).pack(anchor="w")
 
-    internet_frame = _frame(app, app.qutag_timestamp_win)
+    internet_frame = _frame(app, controls_panel)
     internet_frame.pack(fill="x", padx=10, pady=(0, 6))
     app.qutag_timestamp_internet_var = BooleanVar(value=False)
     app.qutag_timestamp_internet_checkbox = _checkbutton(
@@ -389,7 +424,7 @@ def open_qutag_timestamp_window(app):
         entry = _entry(app, internet_frame, textvariable=var, width=width)
         entry.pack(side="left")
         app.qutag_timestamp_internet_entries.append(entry)
-    internet_status_frame = _frame(app, app.qutag_timestamp_win)
+    internet_status_frame = _frame(app, controls_panel)
     internet_status_frame.pack(fill="x", padx=10, pady=(0, 6))
     app.qutag_timestamp_internet_status_var = StringVar(value="Internet disabled")
     app.qutag_timestamp_internet_size_var = StringVar(value="Internet file: 0 B")
@@ -407,7 +442,7 @@ def open_qutag_timestamp_window(app):
     app.qutag_timestamp_internet_sample = (time.monotonic(), 0)
     _poll_timestamp_internet(app)
 
-    status_frame = _frame(app, app.qutag_timestamp_win)
+    status_frame = _frame(app, controls_panel)
     status_frame.pack(fill="x", padx=10, pady=(0, 6))
     app.qutag_timestamp_recording_var = StringVar(value="[REC] OFF")
     recording_status_frame = _frame(app, status_frame)
@@ -464,7 +499,7 @@ def open_qutag_timestamp_window(app):
         fg=_ui(app)["muted"],
     ).pack(side="left", padx=(16, 0))
 
-    limit_frame = _frame(app, app.qutag_timestamp_win)
+    limit_frame = _frame(app, controls_panel)
     limit_frame.pack(fill="x", padx=10, pady=(0, 8))
     app.qutag_timestamp_auto_stop_var = BooleanVar(value=False)
     app.qutag_timestamp_size_limit_var = StringVar(
@@ -497,7 +532,7 @@ def open_qutag_timestamp_window(app):
     )
     _label(app, limit_frame, text="s", fg=_ui(app)["muted"]).pack(side="left")
 
-    button_frame = _frame(app, app.qutag_timestamp_win)
+    button_frame = _frame(app, app.qutag_timestamp_win, surface=True)
     button_frame.pack(fill="x", padx=10, pady=(0, 10))
 
     app.qutag_timestamp_start_writing_button = _button(

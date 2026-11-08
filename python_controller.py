@@ -54,21 +54,19 @@ except Exception:
     TimeTagger = None
     print("Time Tagger X import failed.")
 
-# Keep the HydraHarp settings and QSFP code for later use, but do not load
-# its SDK or open the device while it is disabled.
-ENABLE_HYDRAHARP = False
-LogLevel = MeasMode = RefSource = create_hydraharp_api = None
-if ENABLE_HYDRAHARP:
-    try:
-        from picoquant_snapi import LogLevel, MeasMode, RefSource, create_hydraharp_api
-    except Exception as exc:
-        print(f"HydraHarp snAPI import failed: {exc}")
-
 LASER_HOST = "192.168.1.200"
 TX_PORT = "/dev/ttyACM0"
 RX_PORT = "/dev/ttyACM1"
 DEFAULT_VOLTAGES_PATH = Path(__file__).with_name("20260924_QCSTX1_RB4.json")
 RX_BACKGROUND_OFFSETS_PATH = Path(__file__).with_name("rx_background_offsets.json")
+
+# Temporarily hide these toolbar controls; their functions remain available.
+HIDDEN_TX_TOOLBAR_BUTTONS = frozenset({
+    "Set_Tx_OOK",
+    "Tx_OOK",
+    "QDCP_Status",
+    "Set_Offset",
+})
 
 UI = {
     "bg": "#0b1118",
@@ -173,14 +171,6 @@ class App(TxCommandsMixin, RxCommandsMixin):
         self.hydraharp_time_trace_num_bins = 200
         self.hydraharp_time_trace_history_size_s = 10.0
         self.hydraharp_time_trace_integration_ms = 50.0
-        # Choose the HydraHarp clock before device initialization.  Set this
-        # to RefSource.Internal when no stable external 10 MHz reference is
-        # connected to the HydraHarp reference-clock input.
-        self.hydraharp_ref_source = (
-            RefSource.External_10MHZ if RefSource is not None else None
-            # RefSource.Internal if RefSource is not None else None
-        )
-        self.hydraharp_config_path = Path(__file__).with_name("HH.ini")
         self.hydraharp_time_trace_settings_path = Path(__file__).with_name(
             "hydraharp_time_trace_settings.json"
         )
@@ -200,12 +190,6 @@ class App(TxCommandsMixin, RxCommandsMixin):
         self.hydraharp_sync_cfd_level_mV = 300
         self.hydraharp_sync_zero_cross_mV = 10
         self.hydraharp_sync_delay_ps = 0
-        # Keys use snAPI's zero-based input-channel indices.  Thus key 0 is
-        # the physical HydraHarp input labelled "Ch 1" in the UI.
-        self.hydraharp_startup_channel_defaults = {
-            0: {"cfd_mV": 300, "zero_cross_mV": 10, "delay_ps": 0},
-            1: {"cfd_mV": 150, "zero_cross_mV": 10, "delay_ps": 0},
-        }
         self.spd_series = (
             [("Time Tagger X", channel) for channel in self.spd_counter_indices]
             + [("HydraHarp", channel) for channel in self.hydraharp_channel_indices]
@@ -235,7 +219,6 @@ class App(TxCommandsMixin, RxCommandsMixin):
         print("Connected to RX")
 
         self.init_time_tagger()
-        self.init_hydraharp()
 
         try:
             self.laser = DLCProSimple(LASER_HOST).open()
@@ -367,96 +350,6 @@ class App(TxCommandsMixin, RxCommandsMixin):
             self.time_tagger_logger.exception("Could not apply default settings")
             print("ERROR: Could not apply default Time Tagger X settings:", exc)
         return True
-
-    def init_hydraharp(self):
-        """Start the optional HydraHarp T2 time trace used by the Rx SPD plot."""
-        # The rest of the controller is designed to run without a HydraHarp.
-        # Keep that state explicit before attempting discovery, so any failed
-        # initialization leaves all later code treating it as unavailable.
-        self.hydraharp = None
-        if not ENABLE_HYDRAHARP:
-            print("HydraHarp disabled; continuing without it.")
-            return False
-        if create_hydraharp_api is None:
-            print("HydraHarp unavailable: snAPI wrapper import failed.")
-            return False
-
-        hydraharp = None
-
-        def release_hydraharp():
-            if hydraharp is None:
-                return
-            try:
-                hydraharp.closeDevice()
-            except Exception:
-                pass
-            # snAPI.__del__ releases the native API. An explicit exitAPI()
-            # here can make some Linux builds release it a second time.
-
-        try:
-            hydraharp = create_hydraharp_api()
-            if not hydraharp.getDevice():
-                print("HydraHarp not detected; continuing without it.")
-                release_hydraharp()
-                return False
-            if not hydraharp.initDevice(
-                MeasMode.T2,
-                refSrc=self.hydraharp_ref_source,
-            ):
-                print(
-                    "HydraHarp could not be initialized in T2 mode "
-                    f"({self.hydraharp_ref_source.name}); continuing without it."
-                )
-                release_hydraharp()
-                return False
-
-            hydraharp.setLogLevel(LogLevel.Config, True)
-            if self.hydraharp_config_path.is_file():
-                if not hydraharp.loadIniConfig(str(self.hydraharp_config_path)):
-                    raise RuntimeError(f"Could not load {self.hydraharp_config_path.name}.")
-            else:
-                print(
-                    f"HydraHarp configuration {self.hydraharp_config_path.name} was not found; "
-                    "using device defaults."
-                )
-
-            self.apply_hydraharp_startup_channel_defaults(hydraharp)
-            hydraharp.timeTrace.setNumBins(self.hydraharp_time_trace_num_bins)
-            hydraharp.timeTrace.setHistorySize(self.hydraharp_time_trace_history_size_s)
-            if not hydraharp.timeTrace.measure(0, waitFinished=False, savePTU=False):
-                raise RuntimeError("Could not start HydraHarp time trace.")
-        except Exception as exc:
-            release_hydraharp()
-            print(f"HydraHarp unavailable ({exc}); continuing without it.")
-            return False
-
-        self.hydraharp = hydraharp
-        self.refresh_hydraharp_settings_from_device()
-        print(
-            "Connected to HydraHarp: "
-            f"T2 time trace running ({self.hydraharp_time_trace_num_bins} bins over "
-            f"{self.hydraharp_time_trace_history_size_s:g} s), "
-            f"reference={self.hydraharp_ref_source.name}."
-        )
-        return True
-
-    def apply_hydraharp_startup_channel_defaults(self, hydraharp):
-        """Apply the lab's default sync/input CFD and delay values before measuring."""
-        if not hydraharp.device.setSyncCFD(300, 10):
-            raise RuntimeError("Could not set default HydraHarp sync CFD.")
-
-        num_channels = int(getattr(hydraharp, "deviceConfig", {}).get("NumChans", 0))
-        for channel, settings in self.hydraharp_startup_channel_defaults.items():
-            if channel >= num_channels:
-                continue
-            if not hydraharp.device.setInputCFD(
-                channel,
-                int(settings["cfd_mV"]),
-                int(settings["zero_cross_mV"]),
-            ):
-                raise RuntimeError(f"Could not set default CFD for HydraHarp Ch {channel + 1}.")
-            if not hydraharp.device.setInputChannelOffset(channel, int(settings["delay_ps"])):
-                raise RuntimeError(f"Could not set default delay for HydraHarp Ch {channel + 1}.")
 
     def refresh_hydraharp_settings_from_device(self):
         """Copy the active HydraHarp configuration into editable UI state."""
@@ -1481,6 +1374,8 @@ class App(TxCommandsMixin, RxCommandsMixin):
         button_row.pack(fill="x", pady=(2, 0))
 
         def tx_toolbar_button(side=LEFT, **kwargs):
+            if kwargs.get("text") in HIDDEN_TX_TOOLBAR_BUTTONS:
+                return
             self._button(button_row, size=9, padx=7, pady=5, **kwargs).pack(
                 side=side,
                 padx=3,

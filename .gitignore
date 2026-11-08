@@ -1,0 +1,42 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments and packaging output
+.venv/
+venv/
+env/
+ENV/
+dist/
+build/
+*.egg-info/
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local logs, locks, and incomplete writes
+*.log
+*.log.*
+*.lock
+*.part
+*.tmp
+
+# Generated acquisition data (keep source code and controller JSON settings)
+*.ptu
+*.ttbin
+*.internet.bin
+*.qsfp.bin
+*.source.bin
+hh_t2_returned_*.bin
+
+# Generated measurement reports
+ring_calibration_*.csv
+wavelength_scan_*.csv
+qutag_piezo_scan_*.csv

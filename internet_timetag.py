@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 
 from QCS_HH_TRX import read_json, send_json, receive_data
 
@@ -27,6 +28,8 @@ class InternetCoordinator:
         self.blocks = 0
         self.started = None
         self.finished = None
+        self.remote_start_time_us = None
+        self.remote_start_monotonic_us = None
         self.status = 'Starting Internet listener...'
         self.thread = threading.Thread(target=self._run, name='internet-control', daemon=True)
         self.thread.start()
@@ -35,7 +38,9 @@ class InternetCoordinator:
         with self.lock:
             return dict(ready=self.ready, active=self.active, result=self.result,
                         bytes=self.bytes_saved, blocks=self.blocks, started=self.started,
-                        finished=self.finished, status=self.status)
+                        finished=self.finished, remote_start_time_us=self.remote_start_time_us,
+                        remote_start_monotonic_us=self.remote_start_monotonic_us,
+                        status=self.status)
 
     def record(self, output, duration=3600, max_bytes=16 * 1024**3):
         if not math.isfinite(duration) or not 0.001 <= duration <= 3600:
@@ -52,8 +57,70 @@ class InternetCoordinator:
             self.result = None
             self.bytes_saved = self.blocks = 0
             self.started = self.finished = None
+            self.remote_start_time_us = self.remote_start_monotonic_us = None
             self.status = 'Requesting Windows recording...'
             self.commands.put(('record', (self.session, output, duration, max_bytes)))
+
+    def record_memory(self, on_data, on_metadata, duration=3600, max_bytes=2**63-1):
+        """Receive verified frames through callbacks, without local file writes."""
+        if not math.isfinite(duration) or not 0.001 <= duration <= 3600:
+            raise ValueError('Internet duration must be 0.001..3600 seconds')
+        with self.lock:
+            if not self.ready or self.active:
+                raise RuntimeError('Internet Windows service is not ready')
+            self.session = uuid.uuid4().hex
+            self.active, self.ready = True, False
+            self.result = None
+            self.bytes_saved = self.blocks = 0
+            self.started = self.finished = None
+            self.remote_start_time_us = self.remote_start_monotonic_us = None
+            self.status = 'Requesting remote acquisition into local memory...'
+            self.commands.put(('memory', (self.session, on_data, on_metadata, duration, max_bytes)))
+
+    def _begin_memory(self, conn, values):
+        sid, on_data, on_metadata, duration, maximum = values
+        listener = self._listen(self.data_port)
+        connections = []
+        def receive():
+            try:
+                def connected(sock):
+                    connections.append(sock)
+                    self._track(sock)
+                    with self.lock:
+                        self.started = time.monotonic()
+                        self.status = 'Receiving remote acquisition into local memory...'
+                result = receive_data(listener, None, None, None, sid, self.timeout,
+                                      maximum, duration, connected=connected, quiet=True,
+                                      on_data=on_data, on_metadata=on_metadata,
+                                      progress=self._memory_progress)
+                with self.lock:
+                    self.result = result
+                    self.active = False
+                    self.finished = time.monotonic()
+                    self.status = ('Memory acquisition complete' if result['status'] == 'complete'
+                                   else 'Memory acquisition failed: ' + result.get('error', 'unknown error'))
+                if result['status'] != 'complete':
+                    self.commands.put(('stop', sid))
+            except Exception as exc:
+                result = {'status':'incomplete', 'error':str(exc)}
+                with self.lock:
+                    self.result = result
+                    self.active = False
+                    self.finished = time.monotonic()
+                    self.status = 'Memory acquisition failed: ' + str(exc)
+                self.commands.put(('stop', sid))
+            finally:
+                listener.close()
+                with self.lock:
+                    self.sockets.discard(listener)
+                    for sock in connections:
+                        self.sockets.discard(sock)
+        threading.Thread(target=receive, name='internet-memory', daemon=True).start()
+        send_json(conn, dict(type='RECORD', id=sid, duration=duration))
+
+    def _memory_progress(self, size, blocks):
+        with self.lock:
+            self.bytes_saved, self.blocks = size, blocks
 
     def stop_recording(self):
         with self.lock:
@@ -167,11 +234,26 @@ class InternetCoordinator:
                         kind = None
                     if kind == 'record':
                         self._begin(conn, values)
+                    elif kind == 'memory':
+                        self._begin_memory(conn, values)
                     elif kind == 'stop':
                         send_json(conn, dict(type='STOP', id=values))
                     if not select.select([conn], [], [], 0.1)[0]:
                         continue
                     msg = read_json(conn)
+                    if msg.get('type') == 'ACQ_STARTED':
+                        with self.lock:
+                            if msg.get('id') == self.session:
+                                self.remote_start_time_us = msg.get('start_time_us')
+                                self.remote_start_monotonic_us = msg.get('start_monotonic_us')
+                                start_time_us = self.remote_start_time_us
+                            else:
+                                start_time_us = None
+                        if start_time_us is not None:
+                            seconds, microseconds = divmod(int(start_time_us), 1_000_000)
+                            utc = datetime.fromtimestamp(seconds, timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+                            print(f'HH reported capture start: {utc}.{microseconds:06d}Z '
+                                  f'(Unix us={start_time_us})', flush=True)
                     with self.lock:
                         if msg.get('type') == 'READY':
                             self.ready = True

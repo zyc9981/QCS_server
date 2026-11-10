@@ -134,7 +134,11 @@ class Simulated:
     def __init__(self):
         self.metadata = {'device': 'simulated', 'mode': 'T2', 'base_resolution': None,
                          'device_loss_status': 'not applicable to simulated source'}
-    def capture(self, duration, spool, stop):
+    def capture(self, duration, spool, stop, on_started=None):
+        start_time_us = time.time_ns() // 1_000
+        start_monotonic_us = time.monotonic_ns() // 1_000
+        if on_started is not None:
+            on_started(start_time_us, start_monotonic_us)
         deadline = time.monotonic() + duration
         counter = 0
         while time.monotonic() < deadline and not stop.is_set():
@@ -189,12 +193,18 @@ class Hardware:
         except BaseException:
             self.close()
             raise
-    def capture(self, duration, spool, stop):
+    def capture(self, duration, spool, stop, on_started=None):
         api = self.api
         if not api.raw.startBlock(int(duration * 1000), size=1048576, savePTU=False):
             raise Error('raw.startBlock failed')
+        # Anchor to the successful SDK return, after its buffer allocation and
+        # native start call. This is a host timestamp, not the first photon time.
+        start_time_us = time.time_ns() // 1_000
+        start_monotonic_us = time.monotonic_ns() // 1_000
         stopping = False
         try:
+            if on_started is not None:
+                on_started(start_time_us, start_monotonic_us)
             while True:
                 if stop.is_set() and not stopping:
                     api.raw.stopMeasure()
@@ -233,6 +243,7 @@ def stream_send(host, port, session, spool, path, block, timeout, ready_event, s
             if (ready.get('type') != 'READY' or ready.get('version') != 2 or
                     ready.get('block_size') != block or not valid_id(sid)):
                 raise Error('data receiver did not accept session: %s' % ready)
+            receive_mode = ready.get('receive_mode', 'file')
             send_json(sock, {'type':'START', 'session':sid})
             state['ready'] = True
             ready_event.set()
@@ -248,11 +259,14 @@ def stream_send(host, port, session, spool, path, block, timeout, ready_event, s
             send_json(sock, {'type':'END', 'session':sid, 'bytes':total, 'blocks':count,
                              'records':total//4, 'sha256':digest.hexdigest()})
             saved = read_json(sock)
-            if (saved.get('type') != 'SAVED' or saved.get('session') != sid or
+            expected_ack = 'RECEIVED' if receive_mode == 'memory' else 'SAVED'
+            if (saved.get('type') != expected_ack or saved.get('session') != sid or
                 saved.get('bytes') != total or saved.get('blocks') != count or
                 saved.get('records') != total//4 or saved.get('sha256') != digest.hexdigest()):
-                raise Error('invalid SAVED acknowledgement: %s' % saved)
-            state.update(transfer='complete', linux_saved='verified', sent_bytes=total,
+                raise Error('invalid receiver acknowledgement: %s' % saved)
+            state.update(transfer='complete',
+                         linux_saved='not applicable (received in memory)' if receive_mode == 'memory' else 'verified',
+                         sent_bytes=total,
                          sha256=digest.hexdigest())
     except Exception as exc:
         state.update(transfer='incomplete', linux_saved='unverified', transfer_error=str(exc))
@@ -301,17 +315,26 @@ class Service:
     def record(self, sid, duration, path, file):
         state = {'id':sid, 'requested_duration_seconds':duration, 'local_path':str(path),
                  'capture':'not_started', 'transfer':'incomplete', 'linux_saved':'unverified',
-                 'source':self.source.metadata, 'start_unix':None, 'stop_unix':None}
+                 'source':self.source.metadata, 'start_unix':None, 'start_time_us':None,
+                 'start_monotonic_us':None, 'stop_unix':None}
         spool = Spool(file)
         ready = threading.Event()
         worker = threading.Thread(target=stream_send, args=(self.args.host, self.args.data_port, sid, spool,
                                     path, self.args.block_size, self.args.timeout, ready, state), daemon=True)
         worker.start()
+        def capture_started(start_time_us, start_monotonic_us):
+            state['start_time_us'] = start_time_us
+            state['start_monotonic_us'] = start_monotonic_us
+            state['start_unix'] = start_time_us / 1_000_000
+            self.notify({'type':'ACQ_STARTED', 'id':sid,
+                         'start_time_us':start_time_us,
+                         'start_monotonic_us':start_monotonic_us})
+
         try:
             if not ready.wait(self.args.timeout + 2) or not state.get('ready'):
                 raise Error('data receiver not ready; capture was not started')
-            state['start_unix'] = time.time()
-            state['capture'] = self.source.capture(duration, spool, self.capture_stop)
+            state['capture'] = self.source.capture(
+                duration, spool, self.capture_stop, on_started=capture_started)
             state['stop_unix'] = time.time()
         except Exception as exc:
             state['capture'] = 'failed' if state['start_unix'] else 'not_started'
@@ -408,14 +431,15 @@ class Service:
                     time.sleep(0.1)
         self.source.close()
 def receive_data(listener, output, part_file, manifest, sid, timeout, max_bytes, duration,
-                 progress=None, connected=None, quiet=False):
+                 progress=None, connected=None, quiet=False, on_data=None, on_metadata=None):
+    memory_mode = on_data is not None
     info = {'status':'incomplete', 'request_id':sid, 'bytes_saved':0, 'blocks_saved':0,
-            'output':str(output), 'format':FORMAT}
+            'output':str(output) if output is not None else None, 'format':FORMAT}
     digest = hashlib.sha256()
     try:
         listener.settimeout(timeout)
         conn, peer = listener.accept()
-        with conn, part_file:
+        with conn:
             if connected:
                 connected(conn)
             conn.settimeout(timeout)
@@ -429,7 +453,11 @@ def receive_data(listener, output, part_file, manifest, sid, timeout, max_bytes,
             stream_id = uuid.uuid4().hex
             info.update(peer=str(peer), stream_session=stream_id, block_size=block,
                         capture_metadata=hello['metadata'])
-            send_json(conn, {'type':'READY', 'version':2, 'session':stream_id, 'block_size':block})
+            if on_metadata:
+                on_metadata(hello['metadata'])
+            send_json(conn, {'type':'READY', 'version':2, 'session':stream_id,
+                             'block_size':block,
+                             'receive_mode':'memory' if memory_mode else 'file'})
             start = read_json(conn)
             if start.get('type') != 'START' or start.get('session') != stream_id:
                 raise Error('invalid data START')
@@ -448,7 +476,10 @@ def receive_data(listener, output, part_file, manifest, sid, timeout, max_bytes,
                 data = exact(conn, size)
                 if zlib.crc32(data) & 0xffffffff != crc:
                     raise Error('CRC mismatch in block %d' % seq)
-                part_file.write(data)
+                if part_file is not None:
+                    part_file.write(data)
+                if on_data:
+                    on_data(data)
                 digest.update(data)
                 info['bytes_saved'] += size
                 info['blocks_saved'] += 1
@@ -459,23 +490,31 @@ def receive_data(listener, output, part_file, manifest, sid, timeout, max_bytes,
                 end.get('bytes') != info['bytes_saved'] or end.get('blocks') != info['blocks_saved'] or
                 end.get('records') != info['bytes_saved']//4 or end.get('sha256') != digest.hexdigest()):
                 raise Error('END counts or SHA-256 mismatch')
-            part_file.flush()
-            os.fsync(part_file.fileno())
-            part_file.close()
-            os.link(str(output)+'.part', output)
-            os.unlink(str(output)+'.part')
-            info.update(status='complete', records_saved=info['bytes_saved']//4, sha256=digest.hexdigest())
-            save_json(manifest, info)
-            send_json(conn, {'type':'SAVED', 'session':stream_id, 'bytes':info['bytes_saved'],
-                             'blocks':info['blocks_saved'], 'records':info['records_saved'], 'sha256':info['sha256']})
+            if part_file is not None:
+                part_file.flush()
+                os.fsync(part_file.fileno())
+                part_file.close()
+                os.link(str(output)+'.part', output)
+                os.unlink(str(output)+'.part')
+                info['records_saved'] = info['bytes_saved']//4
+            else:
+                info['records_received'] = info['bytes_saved']//4
+            info.update(status='complete', sha256=digest.hexdigest())
+            if manifest is not None:
+                save_json(manifest, info)
+            send_json(conn, {'type':'RECEIVED' if memory_mode else 'SAVED',
+                             'session':stream_id, 'bytes':info['bytes_saved'],
+                             'blocks':info['blocks_saved'], 'records':info['bytes_saved']//4,
+                             'sha256':info['sha256']})
     except Exception as exc:
         info['error'] = str(exc)
-        if not part_file.closed:
+        if part_file is not None and not part_file.closed:
             part_file.close()
-        try:
-            save_json(manifest, info)
-        except OSError as error:
-            print('Metadata write failed: %s' % error, flush=True)
+        if manifest is not None:
+            try:
+                save_json(manifest, info)
+            except OSError as error:
+                print('Metadata write failed: %s' % error, flush=True)
     finally:
         listener.close()
         if not quiet:

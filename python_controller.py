@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import ast
 import collections
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -776,6 +776,14 @@ class App(TxCommandsMixin, RxCommandsMixin):
         self.time_tagger_marker(f"Acquisition started: Histogram start={start_channel} stop={stop_channel}")
         return measurement
 
+    def create_time_tagger_stream(self, max_events):
+        """Create a separate in-memory event reader for QCS acquisition."""
+        if self.time_tagger is None or TimeTagger is None:
+            raise RuntimeError("Time Tagger X is not initialized")
+        return TimeTagger.TimeTagStream(
+            tagger=self.time_tagger, n_max_events=int(max_events),
+            channels=list(self.time_tagger_setting_channels))
+
     def create_time_tagger_file_writer(self, filename, channels):
         """Start a Time Tagger X FileWriter for the selected input channels."""
         if self.time_tagger is None or TimeTagger is None:
@@ -786,6 +794,18 @@ class App(TxCommandsMixin, RxCommandsMixin):
             tagger=self.time_tagger,
             filename=str(filename),
             channels=[int(channel) for channel in channels],
+        )
+        # Match QCS stream timing: capture integer microseconds immediately
+        # after the measurement constructor returns.
+        self.qutag_timestamp_start_time_us = time.time_ns() // 1_000
+        self.qutag_timestamp_start_monotonic_us = time.monotonic_ns() // 1_000
+        epoch_s, subsecond_us = divmod(self.qutag_timestamp_start_time_us, 1_000_000)
+        utc = datetime.fromtimestamp(epoch_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        print(
+            f"TTX FileWriter created: {utc}.{subsecond_us:06d}Z "
+            f"(Unix us={self.qutag_timestamp_start_time_us}, "
+            f"monotonic us={self.qutag_timestamp_start_monotonic_us})",
+            flush=True,
         )
         self.time_tagger_marker("Timestamp acquisition started: FileWriter")
         return measurement
@@ -1943,6 +1963,11 @@ class App(TxCommandsMixin, RxCommandsMixin):
         self.rx_plot_dirty = True
 
     def _quit_all(self):
+        qcs = getattr(self, "qcs_controller", None)
+        if qcs is not None and qcs.busy:
+            qcs.stop()
+            self.root.after(100, self._quit_all)
+            return
         self.optical_closing = True
         if (
             getattr(self, "qutag_timestamp_writing", False)

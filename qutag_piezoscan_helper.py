@@ -49,9 +49,9 @@ def _ensure_qutag_piezoscan_state(app):
     app.qutag_piezoscan_ax = None
     app.qutag_piezoscan_lines = []
 
-    app.last_qutag_piezoscan_range_V = getattr(app, "last_qutag_piezoscan_range_V", 20.0)
-    app.last_qutag_piezoscan_step_V = getattr(app, "last_qutag_piezoscan_step_V", 0.2)
-    app.last_qutag_piezoscan_settle_ms = getattr(app, "last_qutag_piezoscan_settle_ms", 10)
+    app.last_qutag_piezoscan_range_V = getattr(app, "last_qutag_piezoscan_range_V", 30.0)
+    app.last_qutag_piezoscan_step_V = getattr(app, "last_qutag_piezoscan_step_V", 0.5)
+    app.last_qutag_piezoscan_settle_ms = getattr(app, "last_qutag_piezoscan_settle_ms", 5)
     app.last_qutag_piezoscan_live_plot = getattr(app, "last_qutag_piezoscan_live_plot", False)
     app.last_qutag_piezoscan_auto_correct_rtrbot = getattr(
         app,

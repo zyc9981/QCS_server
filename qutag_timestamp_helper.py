@@ -206,6 +206,8 @@ def _style_legend(app, legend):
 
 
 def open_qutag_timestamp_window(app):
+    from QCS_algorithm import DEFAULT_QCS_CONFIG
+
     existing_window = getattr(app, "qutag_timestamp_win", None)
     if existing_window is not None and existing_window.winfo_exists():
         existing_window.lift()
@@ -287,7 +289,7 @@ def open_qutag_timestamp_window(app):
     app.qutag_lock_running = False
     app.qutag_lock_target_ratio = getattr(app, "qutag_lock_target_ratio", 0.9)
     app.qutag_lock_channel = getattr(app, "qutag_lock_channel", 1)
-    app.qutag_lock_rate = getattr(app, "qutag_lock_rate", 0.15)
+    app.qutag_lock_rate = getattr(app, "qutag_lock_rate", 0.3)
     app.qutag_lock_initial_voltage = None
     app.qutag_lock_start_voltage = None
     app.qutag_lock_peak_voltage = None
@@ -317,7 +319,72 @@ def open_qutag_timestamp_window(app):
     controls_panel = _frame(app, content, surface=True)
     controls_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
     controls_panel.grid_columnconfigure(0, weight=1)
-    _frame(app, content).grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+    qcs_panel = _frame(app, content)
+    qcs_panel.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+    qcs_panel.grid_columnconfigure(0, weight=1)
+    qcs_panel.grid_rowconfigure(0, weight=1, uniform="qcs_sections")
+    qcs_panel.grid_rowconfigure(1, weight=1, uniform="qcs_sections")
+    init_panel = _frame(app, qcs_panel, surface=True)
+    init_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+    tracking_panel = _frame(app, qcs_panel, surface=True)
+    tracking_panel.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+    _label(app, init_panel, text="QCS initialization").grid(
+        row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 4))
+
+    def qcs_parameter(parent, label, variable_name, entry_name, saved_name, default,
+                      row_index, column_index):
+        # Keep three compact label/entry groups on each parameter row.
+        group = _frame(app, parent)
+        group.grid(row=row_index, column=column_index, sticky="ew", padx=4, pady=2)
+        group.grid_columnconfigure(0, weight=1)
+        _label(app, group, text=label).grid(row=0, column=0, sticky="w")
+        var = StringVar(value=getattr(app, saved_name, default))
+        setattr(app, variable_name, var)
+        entry = _entry(app, group, textvariable=var, width=9)
+        entry.configure(bg="white", fg="black", insertbackground="black",
+                        disabledbackground="white", disabledforeground="#666666")
+        entry.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        setattr(app, entry_name, entry)
+
+    for column in range(3):
+        init_panel.grid_columnconfigure(column, weight=1, uniform="qcs_init_parameters")
+    qcs_parameter(init_panel, "T_acq_init", "qcs_init_interval_var",
+                  "qcs_init_interval_entry", "qcs_init_interval_text",
+                  f"{DEFAULT_QCS_CONFIG['init_interval_s']:g}", 1, 0)
+    qcs_parameter(init_panel, "sweep_range_ps_s", "qcs_sweep_range_var",
+                  "qcs_sweep_range_entry", "qcs_sweep_range_text",
+                  f"{DEFAULT_QCS_CONFIG['sweep_range_ps_per_s']:g}", 1, 1)
+    qcs_parameter(init_panel, "sweep_num", "qcs_sweep_num_var",
+                  "qcs_sweep_num_entry", "qcs_sweep_num_text",
+                  f"{DEFAULT_QCS_CONFIG['coarse_steps']:g}", 1, 2)
+    qcs_parameter(init_panel, "offset_range_init_ms", "qcs_offset_range_var",
+                  "qcs_offset_range_entry", "qcs_offset_range_text",
+                  f"{DEFAULT_QCS_CONFIG['init_time_offset_range_ms']:g}", 2, 0)
+    qcs_parameter(init_panel, "init_bin_number", "qcs_init_bin_number_var",
+                  "qcs_init_bin_number_entry", "qcs_init_bin_number_text",
+                  f"{DEFAULT_QCS_CONFIG['init_bin_number']:g}", 2, 1)
+    qcs_parameter(init_panel, "latency_ms", "qcs_latency_ms_var",
+                  "qcs_latency_ms_entry", "qcs_latency_ms_text",
+                  f"{DEFAULT_QCS_CONFIG['latency_ms']:g}", 2, 2)
+    app.qcs_initialization_var = StringVar(value="Waiting for initialization")
+    init_label = _label(app, init_panel, textvariable=app.qcs_initialization_var)
+    init_label.configure(wraplength=500, justify="left")
+    init_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=4)
+
+    _label(app, tracking_panel, text="QCS live tracking").grid(
+        row=0, column=0, sticky="w", padx=12, pady=(8, 4))
+    tracking_panel.grid_columnconfigure(0, weight=1)
+    qcs_parameter(tracking_panel, "T_acq_s", "qcs_interval_var",
+                  "qcs_interval_entry", "qcs_interval_text",
+                  f"{DEFAULT_QCS_CONFIG['acquisition_interval_s']:g}", 1, 0)
+    app.qcs_status_var = StringVar(value="Idle — enable Internet and wait for the remote node")
+    app.qcs_counts_var = StringVar(value="Time Tagger X: 0 events | HydraHarp: 0 events")
+    app.qcs_quality_var = StringVar(value="Data quality: waiting for a completed interval")
+    for variable in (app.qcs_status_var, app.qcs_counts_var, app.qcs_quality_var):
+        label = _label(app, tracking_panel, textvariable=variable)
+        label.configure(wraplength=500, justify="left")
+        label.grid(row=2 + len(tracking_panel.grid_slaves(row=2)),
+                   column=0, sticky="w", padx=12, pady=3)
 
     figure = Figure(figsize=(4.8, 2.7), dpi=100)
     axis = figure.add_subplot(111)
@@ -584,8 +651,113 @@ def open_qutag_timestamp_window(app):
         variant="danger",
     ).pack(side="right")
 
+    app.qcs_start_button = _button(app, button_frame, text="QCS_start",
+                                   command=lambda: _start_qcs(app), variant="primary")
+    app.qcs_start_button.pack(side="left", padx=(0, 8))
+    app.qcs_stop_button = _button(app, button_frame, text="QCS_stop",
+                                  command=lambda: _stop_qcs(app))
+    app.qcs_stop_button.pack(side="left", padx=(0, 8))
+    app.qcs_stop_button.configure(state="disabled")
+    _poll_qcs(app)
+
     app.qutag_timestamp_win.protocol("WM_DELETE_WINDOW", lambda: _close_timestamp_window(app))
     _poll_qutag_counts(app)
+
+
+def _start_qcs(app):
+    from QCS_algorithm import RealtimeG2Controller
+    previous = getattr(app, "qcs_controller", None)
+    if previous is not None and previous.busy:
+        return
+    try:
+        interval = float(app.qcs_interval_var.get())
+        controller = RealtimeG2Controller(app, {'acquisition_interval_s': interval,
+                                                   'init_interval_s': float(app.qcs_init_interval_var.get()),
+                                                   'latency_ms': float(app.qcs_latency_ms_var.get()),
+                                                   'global_alignment_kwargs': {
+                                                       'coarse_steps': int(app.qcs_sweep_num_var.get()),
+                                                       'sweep_range_ps_per_s': float(app.qcs_sweep_range_var.get()),
+                                                       'init_time_offset_range_ms': float(app.qcs_offset_range_var.get()),
+                                                       'init_bin_number': int(app.qcs_init_bin_number_var.get())}})
+        app.qcs_sweep_range_text = app.qcs_sweep_range_var.get()
+        app.qcs_sweep_num_text = app.qcs_sweep_num_var.get()
+        app.qcs_offset_range_text = app.qcs_offset_range_var.get()
+        app.qcs_init_bin_number_text = app.qcs_init_bin_number_var.get()
+        app.qcs_latency_ms_text = app.qcs_latency_ms_var.get()
+        app.qcs_init_interval_text = app.qcs_init_interval_var.get()
+        app.qcs_interval_text = app.qcs_interval_var.get()
+        controller.start()
+        app.qcs_controller = controller
+        app.qcs_status_var.set(controller.status)
+    except Exception as exc:
+        messagebox.showerror("QCS acquisition", str(exc), parent=app.qutag_timestamp_win)
+
+
+def _stop_qcs(app):
+    controller = getattr(app, "qcs_controller", None)
+    if controller is not None:
+        controller.stop()
+        app.qcs_status_var.set(controller.status)
+
+
+def _poll_qcs(app):
+    window = getattr(app, "qutag_timestamp_win", None)
+    if window is None or not window.winfo_exists():
+        return
+    controller = getattr(app, "qcs_controller", None)
+    busy = controller is not None and controller.busy
+    if controller is not None:
+        update = controller.poll_update()
+        if update is not None:
+            app.qcs_status_var.set(update['status'])
+            app.qcs_initialization_var.set(update['initialization_status'])
+            quality = update.get('quality')
+            if quality is not None:
+                reasons = '; '.join(quality['reasons']) or 'Required channels populated; arrays chronological'
+                app.qcs_quality_var.set(f"Interval {quality['sequence']}: {quality['status']} — {reasons}. "
+                                        + quality['network'])
+            if update.get('integrity_failure'):
+                app.qcs_quality_var.set('Acquisition integrity failure: ' + update['integrity_failure'])
+            counts = update['retained']
+            app.qcs_counts_var.set(
+                f"Current interval: TTX {counts['ttx']:,} | HH {counts['hh']:,} events; "
+                f"completed: {update['completed_intervals']}; "
+                f"capacity drops: {sum(update['evicted'].values()):,}. "
+                f"TTX total {update['total']['ttx']:,} in {update['elapsed_s']:.2f} s "
+                f"({update['total']['ttx'] / max(update['elapsed_s'], 1e-9):,.0f} events/s); "
+                f"per channel {update['ttx_channel_totals']}")
+        if controller.alignment_result is not None and not controller.alignment_plot_shown:
+            controller.alignment_plot_shown = True
+            try:
+                from qcs_analyzer.global_freq_analysis import plot_global_freq_alignment_result
+                plot_global_freq_alignment_result(controller.alignment_result)
+            except Exception as exc:
+                app.qcs_initialization_var.set(f"Alignment complete, but plotting failed: {exc}")
+                print(f"QCS alignment plot failed: {exc}", flush=True)
+    if controller is not None and not controller.running:
+        remote = controller.remote.snapshot() if controller.remote is not None else None
+        if remote is not None and remote['active']:
+            app.qcs_status_var.set("Stopping QCS — draining the remote stream...")
+        elif remote is not None and remote['result'] is not None and remote['result']['status'] != 'complete':
+            reason = remote['result'].get('error', remote['status'])
+            app.qcs_status_var.set("QCS remote error: " + reason)
+            app.qcs_quality_var.set("Session integrity failed: " + reason + "; previous intervals are unverified")
+        elif remote is not None and remote['result'] is not None and controller.quality is not None and not controller.integrity_failure:
+            app.qcs_quality_var.set(f"Interval {controller.quality['sequence']}: {controller.quality['status']}; "
+                                   + '; '.join(controller.quality['reasons'])
+                                   + ". Network session SHA-256 verified; remote device loss is not certified.")
+    app.qcs_sweep_range_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_sweep_num_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_offset_range_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_init_bin_number_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_latency_ms_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_init_interval_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_interval_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_start_button.configure(state="disabled" if busy else "normal")
+    app.qcs_stop_button.configure(state="normal" if busy else "disabled")
+    app.qutag_timestamp_start_writing_button.configure(
+        state="disabled" if busy or not app.qutag_timestamp_time_tagger_available else "normal")
+    window.after(100, lambda: _poll_qcs(app))
 
 
 def _timestamp_internet_enabled(app):
@@ -786,6 +958,10 @@ def _normalize_timestamp_filename(filename):
 
 
 def _start_timestamp_writing(app):
+    qcs = getattr(app, "qcs_controller", None)
+    if qcs is not None and qcs.busy:
+        messagebox.showerror("Time Stamps", "Stop QCS before writing files.", parent=app.qutag_timestamp_win)
+        return
     if getattr(app, "optical_capture_active", False):
         messagebox.showerror(
             "Time Stamps",
@@ -1832,7 +2008,7 @@ def _open_lock_settings(app):
 
     target_var = StringVar(value=str(getattr(app, "qutag_lock_target_ratio", 0.9)))
     channel_var = StringVar(value=str(getattr(app, "qutag_lock_channel", 1)))
-    rate_var = StringVar(value=str(getattr(app, "qutag_lock_rate", 0.15)))
+    rate_var = StringVar(value=str(getattr(app, "qutag_lock_rate", 0.3)))
 
     _label(app, frame, text="Target ratio (0-1):").grid(row=0, column=0, sticky="e", padx=6, pady=6)
     _entry(app, frame, textvariable=target_var, width=10).grid(row=0, column=1, padx=6, pady=6)
@@ -1944,7 +2120,7 @@ def _apply_lock_from_counts(app, data):
         target_voltage = _interpolate_voltage_for_count(calibration["branch"], target_count)
         current_equiv_voltage = _interpolate_voltage_for_count(calibration["branch"], current_count)
         full_correction_voltage = target_voltage - current_equiv_voltage
-        rate = float(getattr(app, "qutag_lock_rate", 0.15))
+        rate = float(getattr(app, "qutag_lock_rate", 0.3))
         correction_voltage = full_correction_voltage * rate
         current_setpoint = _get_piezo_setpoint(app)
         lock_start_voltage = getattr(app, "qutag_lock_start_voltage", None)
@@ -2053,6 +2229,11 @@ def _clamp(value, low, high):
 
 
 def _close_timestamp_window(app):
+    controller = getattr(app, "qcs_controller", None)
+    if controller is not None and controller.busy:
+        controller.stop()
+        app.qutag_timestamp_win.after(100, lambda: _close_timestamp_window(app))
+        return
     _stop_lock(app)
     app.qutag_timestamp_streaming = False
 

@@ -7,7 +7,7 @@
   "PPS_RTR": {
     "chip_id": 1,
     "pin": 8,
-    "voltage": 10.38
+    "voltage": 11.3
   },
   "PPS_CPL": {
     "chip_id": 1,

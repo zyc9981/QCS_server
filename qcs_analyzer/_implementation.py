@@ -437,25 +437,38 @@ def _iter_hydraharp_qsfp_chunks(
             records = np.fromfile(stream, dtype="<u4", count=int(chunk_size))
             if not len(records):
                 break
-            special = (records >> 31) != 0
-            channels = (records >> 25) & 0x3F
-            timetags = (records & 0x1FFFFFF).astype(np.int64)
-            overflow = special & (channels == 63)
-            overflow_counts = np.where(overflow, np.maximum(timetags, 1), 0)
-            corrections = np.cumsum(overflow_counts, dtype=np.int64) * (1 << 25)
-            corrections += overflow_correction
-            overflow_correction = int(corrections[-1])
-            events = ~special | (channels == 0)
-            if not np.any(events):
-                continue
-            times = (timetags + corrections)[events]
-            if times.max() > np.iinfo(np.int64).max // int(resolution):
-                raise ValueError("HydraHarp timestamps exceed the int64 picosecond range.")
-            times *= int(resolution)
-            event_channels = channels[events].astype(np.int64)
-            event_channels += (~special[events]).astype(np.int64)
-            event_channels += int(channel_offset)
-            yield times, event_channels
+            times, channels, overflow_correction = decode_hydraharp_t2_records(
+                records, overflow_correction, channel_offset, int(resolution))
+            if len(times):
+                yield times, channels
+
+
+def decode_hydraharp_t2_records(records, overflow_correction=0, channel_offset=0,
+                                base_resolution_ps=1):
+    """Decode one V2 T2 block, retaining overflow state across block boundaries."""
+    resolution = float(base_resolution_ps)
+    if not np.isfinite(resolution) or resolution <= 0 or not resolution.is_integer():
+        raise ValueError("HydraHarp base resolution must be a positive integer in ps")
+    records = np.asarray(records, dtype="<u4")
+    if not len(records):
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), overflow_correction
+    special = (records >> 31) != 0
+    channels = (records >> 25) & 0x3F
+    timetags = (records & 0x1FFFFFF).astype(np.int64)
+    overflow = special & (channels == 63)
+    overflow_counts = np.where(overflow, np.maximum(timetags, 1), 0)
+    corrections = np.cumsum(overflow_counts, dtype=np.int64) * (1 << 25)
+    corrections += overflow_correction
+    overflow_correction = int(corrections[-1])
+    events = ~special | (channels == 0)
+    times = (timetags + corrections)[events]
+    if len(times) and times.max() > np.iinfo(np.int64).max // int(resolution):
+        raise ValueError("HydraHarp timestamps exceed the int64 picosecond range")
+    times *= int(resolution)
+    event_channels = channels[events].astype(np.int64)
+    event_channels += (~special[events]).astype(np.int64)
+    event_channels += int(channel_offset)
+    return times, event_channels, overflow_correction
 
 
 def _iter_h5_timetag_chunks(

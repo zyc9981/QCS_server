@@ -205,6 +205,16 @@ def _style_legend(app, legend):
         text.set_color(colors["text"])
 
 
+def _qcs_integer_value(text, label):
+    try:
+        value = float(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a whole number") from exc
+    if not math.isfinite(value) or not value.is_integer():
+        raise ValueError(f"{label} must be a whole number")
+    return int(value)
+
+
 def open_qutag_timestamp_window(app):
     from QCS_algorithm import DEFAULT_QCS_CONFIG
 
@@ -338,7 +348,13 @@ def open_qutag_timestamp_window(app):
         group.grid(row=row_index, column=column_index, sticky="ew", padx=4, pady=2)
         group.grid_columnconfigure(0, weight=1)
         _label(app, group, text=label).grid(row=0, column=0, sticky="w")
-        var = StringVar(value=getattr(app, saved_name, default))
+        initial_value = getattr(app, saved_name, default)
+        if variable_name in ("qcs_sweep_num_var", "qcs_init_bin_number_var"):
+            try:
+                initial_value = str(_qcs_integer_value(initial_value, label))
+            except ValueError:
+                pass
+        var = StringVar(value=initial_value)
         setattr(app, variable_name, var)
         entry = _entry(app, group, textvariable=var, width=9)
         entry.configure(bg="white", fg="black", insertbackground="black",
@@ -356,13 +372,13 @@ def open_qutag_timestamp_window(app):
                   f"{DEFAULT_QCS_CONFIG['sweep_range_ps_per_s']:g}", 1, 1)
     qcs_parameter(init_panel, "sweep_num", "qcs_sweep_num_var",
                   "qcs_sweep_num_entry", "qcs_sweep_num_text",
-                  f"{DEFAULT_QCS_CONFIG['coarse_steps']:g}", 1, 2)
+                  str(DEFAULT_QCS_CONFIG['coarse_steps']), 1, 2)
     qcs_parameter(init_panel, "offset_range_init_ms", "qcs_offset_range_var",
                   "qcs_offset_range_entry", "qcs_offset_range_text",
                   f"{DEFAULT_QCS_CONFIG['init_time_offset_range_ms']:g}", 2, 0)
     qcs_parameter(init_panel, "init_bin_number", "qcs_init_bin_number_var",
                   "qcs_init_bin_number_entry", "qcs_init_bin_number_text",
-                  f"{DEFAULT_QCS_CONFIG['init_bin_number']:g}", 2, 1)
+                  str(DEFAULT_QCS_CONFIG['init_bin_number']), 2, 1)
     qcs_parameter(init_panel, "latency_ms", "qcs_latency_ms_var",
                   "qcs_latency_ms_entry", "qcs_latency_ms_text",
                   f"{DEFAULT_QCS_CONFIG['latency_ms']:g}", 2, 2)
@@ -671,14 +687,19 @@ def _start_qcs(app):
         return
     try:
         interval = float(app.qcs_interval_var.get())
+        sweep_num = _qcs_integer_value(app.qcs_sweep_num_var.get(), "sweep_num")
+        init_bin_number = _qcs_integer_value(
+            app.qcs_init_bin_number_var.get(), "init_bin_number")
+        app.qcs_sweep_num_var.set(str(sweep_num))
+        app.qcs_init_bin_number_var.set(str(init_bin_number))
         controller = RealtimeG2Controller(app, {'acquisition_interval_s': interval,
                                                    'init_interval_s': float(app.qcs_init_interval_var.get()),
                                                    'latency_ms': float(app.qcs_latency_ms_var.get()),
                                                    'global_alignment_kwargs': {
-                                                       'coarse_steps': int(app.qcs_sweep_num_var.get()),
+                                                       'coarse_steps': sweep_num,
                                                        'sweep_range_ps_per_s': float(app.qcs_sweep_range_var.get()),
                                                        'init_time_offset_range_ms': float(app.qcs_offset_range_var.get()),
-                                                       'init_bin_number': int(app.qcs_init_bin_number_var.get())}})
+                                                       'init_bin_number': init_bin_number}})
         app.qcs_sweep_range_text = app.qcs_sweep_range_var.get()
         app.qcs_sweep_num_text = app.qcs_sweep_num_var.get()
         app.qcs_offset_range_text = app.qcs_offset_range_var.get()

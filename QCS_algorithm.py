@@ -23,7 +23,7 @@ DEFAULT_QCS_CONFIG = {
     'sweep_range_ps_per_s': 1000.0,
     'init_time_offset_range_ms': 40.0,
     'coarse_steps': 50,
-    'init_bin_number': 2000_000,
+    'init_bin_number': 2_000_000,
     'latency_ms': 250.0,
 }
 

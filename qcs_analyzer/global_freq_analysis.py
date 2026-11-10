@@ -1,6 +1,49 @@
 """Frequency estimation from sparse detections of a periodic pulse train."""
 
 import numpy as np
+from numba import njit
+import time
+
+
+@njit
+def _g2_counts_for_skew(first_ps, second_ps, second_elapsed_ps, edges_ps, skew):
+    """Apply one skew and count delay pairs without the public wrapper overhead."""
+    n_bins = len(edges_ps) - 1
+    bin_width_ps = edges_ps[1] - edges_ps[0]
+    lower_ps = edges_ps[0]
+    upper_ps = edges_ps[-1]
+    counts = np.zeros(n_bins, dtype=np.int64)
+    n_second = len(second_ps)
+    corrected_second = np.empty_like(second_ps)
+    for j in range(n_second):
+        corrected_second[j] = second_ps[j] + second_elapsed_ps[j] * skew
+    j_start = 0
+
+    for i in range(len(first_ps)):
+        timestamp_a = first_ps[i]
+        while j_start < n_second:
+            if corrected_second[j_start] - timestamp_a >= lower_ps:
+                break
+            j_start += 1
+        if j_start == n_second:
+            break
+
+        j = j_start
+        while j < n_second:
+            delay_ps = corrected_second[j] - timestamp_a
+            if delay_ps >= upper_ps:
+                break
+
+            bin_index = int(np.floor((delay_ps - lower_ps) / bin_width_ps))
+            bin_index = min(max(bin_index, 0), n_bins - 1)
+            while bin_index > 0 and delay_ps < edges_ps[bin_index]:
+                bin_index -= 1
+            while bin_index < n_bins - 1 and delay_ps >= edges_ps[bin_index + 1]:
+                bin_index += 1
+            counts[bin_index] += 1
+            j += 1
+
+    return counts
 
 
 def estimate_pulse_train_frequency(
@@ -151,11 +194,9 @@ def global_freq_alignment_g2(
     t1_ps,
     t2_ps,
     *,
-
     init_time_offset_range_ms=5.0,
     init_bin_number=500_000,
     min_init_overlap_fraction=0.1,
-
     sweep_range_ps_per_s=20000.0,
     sweep_center_ps_per_s=0.0,
     time_offset_range_ns=1000.0,
@@ -183,9 +224,9 @@ def global_freq_alignment_g2(
     Its lag-dependent counts are divided by the number of overlapping time
     bins; lags with less than ``min_init_overlap_fraction`` of the maximum
     possible overlap are excluded from peak selection.
-    Each sweep trial applies a linear time correction to stream 2 and calculates
-    the pair-delay histogram with :func:`qcs_kernal.g2_histogram_numba`. The
-    candidate with the strongest peak above the histogram background is kept.
+    Each sweep trial applies a linear time correction while counting event
+    pairs in a compiled loop. The candidate with the strongest peak above the
+    histogram background is kept.
 
     The returned ``g2_histogram`` contains raw pair counts, not normalized
     g2 values. ``peak_score`` is a heuristic ranking of the largest bin; it
@@ -214,6 +255,10 @@ def global_freq_alignment_g2(
     just the number of histogram bins; a broad window can be costly at high
     count rates.
     """
+
+    # ------------------------------------------------------------------
+    # 1. Validate timestamp inputs and search parameters
+    # ------------------------------------------------------------------
     first = np.asarray(t1_ps).ravel()
     second = np.asarray(t2_ps).ravel()
     if first.size < 2 or second.size < 2:
@@ -262,8 +307,12 @@ def global_freq_alignment_g2(
         raise ValueError("max_bin_number must be an integer of at least 2.")
     if int(coarse_steps) != coarse_steps or coarse_steps < 3:
         raise ValueError("coarse_steps must be an integer of at least 3.")
-    from .qcs_kernal import g2_histogram_numba
+    from scipy import fft as scipy_fft
 
+    # ------------------------------------------------------------------
+    # 2. Sort timestamps and establish the shared relative time axis
+    # ------------------------------------------------------------------
+    t0 = time.time()
     first = np.sort(first)
     second = np.sort(second)
     time_origin_ps = min(first[0], second[0])
@@ -279,6 +328,12 @@ def global_freq_alignment_g2(
         raise ValueError("Each timestamp array must span a positive duration.")
 
     acquisition_duration_s = duration_ps * 1e-12
+    print("step2: ", time.time() - t0)
+
+    # ------------------------------------------------------------------
+    # 3. Initialization: estimate the coarse t2 - t1 delay with an FFT
+    # ------------------------------------------------------------------
+    t0 = time.time()
     init_min_ps = init_min_ms * 1e9
     init_max_ps = init_max_ms * 1e9
     init_bin_width_ps = (init_max_ps - init_min_ps) / int(init_bin_number)
@@ -290,14 +345,21 @@ def global_freq_alignment_g2(
     first_bin = np.floor(first_ps / init_bin_width_ps).astype(np.int64)
     second_bin = np.floor(init_second_ps / init_bin_width_ps).astype(np.int64)
     n_time_bins = max(int(first_bin.max()), int(second_bin.max())) + 1
+    # A linear correlation needs at least 2*n_time_bins - 1 points. Select
+    # SciPy's next efficient length instead of always rounding up to a power
+    # of two, and keep the spectra product in place to limit peak allocations.
+    n_fft = scipy_fft.next_fast_len(2 * n_time_bins - 1, real=True)
     first_hist = np.bincount(first_bin, minlength=n_time_bins).astype(np.float64)
+    first_spectrum = scipy_fft.rfft(first_hist, n=n_fft)
+    del first_hist
     second_hist = np.bincount(second_bin, minlength=n_time_bins).astype(np.float64)
-    n_fft = 1 << (2 * n_time_bins - 2).bit_length()
-    correlation_circular = np.fft.irfft(
-        np.fft.rfft(second_hist, n=n_fft)
-        * np.conj(np.fft.rfft(first_hist, n=n_fft)),
-        n=n_fft,
-    )
+    second_spectrum = scipy_fft.rfft(second_hist, n=n_fft)
+    del second_hist
+    np.conjugate(first_spectrum, out=first_spectrum)
+    np.multiply(second_spectrum, first_spectrum, out=second_spectrum)
+    del first_spectrum
+    correlation_circular = scipy_fft.irfft(second_spectrum, n=n_fft, overwrite_x=True)
+    del second_spectrum
     min_lag_bin = max(int(np.ceil(init_min_ps / init_bin_width_ps)), -(n_time_bins - 1))
     max_lag_bin = min(int(np.floor(init_max_ps / init_bin_width_ps)), n_time_bins - 1)
     if min_lag_bin > max_lag_bin:
@@ -310,11 +372,19 @@ def global_freq_alignment_g2(
         correlation_circular[np.mod(init_lag_bins, n_fft)]
     ).astype(np.int64)
     init_centers_ps = init_lag_bins.astype(np.float64) * init_bin_width_ps
+    del correlation_circular
+    print("step3: ", time.time() - t0)
+
+    # ------------------------------------------------------------------
+    # 4. Correct for lag-dependent overlap and select the initial delay
+    # ------------------------------------------------------------------
     # Raw cross-correlation counts fall with lag when less of the two finite
     # records overlaps. Divide by the shared temporal support at each lag so
     # the edge envelope does not bias the selected initialization delay.
+    t0 = time.time()
     first_start, first_end = int(first_bin.min()), int(first_bin.max())
     second_start, second_end = int(second_bin.min()), int(second_bin.max())
+    del first_bin, second_bin, init_second_ps
     overlap_bins = np.maximum(
         0,
         np.minimum(first_end, second_end - init_lag_bins)
@@ -344,6 +414,11 @@ def global_freq_alignment_g2(
         int(max_bin_number) + 1,
         dtype=np.float64,
     )
+    print("step4: ", time.time() - t0)
+
+    # ------------------------------------------------------------------
+    # 5. Prepare the fine g2 histogram window around the initial delay
+    # ------------------------------------------------------------------
     print(
         f"g2 initialization complete: peak delay={init_peak_delay_ps * 1e-3:.6f} ns, "
         f"peak counts={int(init_histogram[init_peak_index]):,}, "
@@ -355,6 +430,9 @@ def global_freq_alignment_g2(
     bin_centers_ns = (edges_ps[:-1] + edges_ps[1:]) * 0.5e-3
     skew_range_s_per_s = sweep_range_ps_per_s * 1e-12
 
+    # ------------------------------------------------------------------
+    # 6. Optionally display the initialization result
+    # ------------------------------------------------------------------
     if show_plot:
         import matplotlib.pyplot as plt
 
@@ -385,6 +463,9 @@ def global_freq_alignment_g2(
         plt.show(block=False)
         plt.pause(0.05)
 
+    # ------------------------------------------------------------------
+    # 7. Sweep frequency corrections and score each candidate's g2 peak
+    # ------------------------------------------------------------------
     def sweep(candidates):
         scores = np.empty(len(candidates), dtype=np.float64)
         peak_counts = np.empty(len(candidates), dtype=np.int64)
@@ -397,17 +478,13 @@ def global_freq_alignment_g2(
         for index, skew in enumerate(candidates):
             # Every trial starts with the original array, anchored at the
             # same reference event. No previous trial feeds into this one.
-            corrected_second = second_ps + second_elapsed_ps * float(skew)
-            result = g2_histogram_numba(
+            histogram = _g2_counts_for_skew(
                 first_ps,
-                corrected_second,
+                second_ps,
+                second_elapsed_ps,
                 edges_ps,
-                Ta_s=acquisition_duration_s,
-                chA=None,
-                chB=None,
-                time_bin_ps_init=bin_width_ps,
+                float(skew),
             )
-            histogram = result["histogram_raw"]
             peak_index = int(np.argmax(histogram))
             peak = int(histogram[peak_index])
 
@@ -455,11 +532,17 @@ def global_freq_alignment_g2(
             peak_counts, background_counts, peak_delays_ps,
         )
 
+    # ------------------------------------------------------------------
+    # 8. Run the coarse sweep and choose the best frequency correction
+    # ------------------------------------------------------------------
+    t0 = time.time()
     coarse_candidates = np.linspace(
         sweep_center_ps_per_s - sweep_range_ps_per_s,
         sweep_center_ps_per_s + sweep_range_ps_per_s,
         int(coarse_steps),
     ) * 1e-12
+    if np.any(1.0 + coarse_candidates <= 0.0):
+        raise ValueError("The frequency sweep corrections must preserve timestamp order.")
     (
         coarse_best, coarse_x, coarse_scores, changed_bins, max_count_changes,
         peak_counts, background_counts, peak_delays_ps,
@@ -483,7 +566,11 @@ def global_freq_alignment_g2(
         f"score={best['score']:.3f}{tied_message}",
         flush=True,
     )
+    print("step8: ", time.time() - t0)
 
+    # ------------------------------------------------------------------
+    # 9. Optionally plot the selected g2 histogram and sweep scores
+    # ------------------------------------------------------------------
     if show_plot:
         import matplotlib.pyplot as plt
 
@@ -515,6 +602,9 @@ def global_freq_alignment_g2(
         final_figure.tight_layout()
         plt.show()
 
+    # ------------------------------------------------------------------
+    # 10. Return alignment, histogram, and diagnostic data
+    # ------------------------------------------------------------------
     return {
         "skew_s_per_s": best["skew"],
         "skew_ps_per_s": best["skew"] * 1e12,

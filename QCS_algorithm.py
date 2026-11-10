@@ -20,11 +20,17 @@ import numpy as np
 DEFAULT_QCS_CONFIG = {
     'init_interval_s': 2.0,
     'acquisition_interval_s': 1.0,
-    'sweep_range_ps_per_s': 1000.0,
-    'init_time_offset_range_ms': 40.0,
-    'coarse_steps': 50,
-    'init_bin_number': 2_000_000,
+
     'latency_ms': 250.0,
+    'init_time_offset_range_ms': 40.0,
+    'init_bin_number': 1_000_000,
+
+    'sweep_range_ps_per_s': 2000.0,
+    'coarse_steps': 40,
+
+    'fine_steps': 20,
+    'fine_sweep_range_ps_per_s': 100.0,
+    
 }
 
 
@@ -72,15 +78,23 @@ class RealtimeG2Controller:
             'init_time_offset_range_ms', DEFAULT_QCS_CONFIG['init_time_offset_range_ms'])
         alignment_options.setdefault('init_bin_number', DEFAULT_QCS_CONFIG['init_bin_number'])
         alignment_options.setdefault('coarse_steps', DEFAULT_QCS_CONFIG['coarse_steps'])
+        alignment_options.setdefault('fine_steps', DEFAULT_QCS_CONFIG['fine_steps'])
+        alignment_options.setdefault(
+            'fine_sweep_range_ps_per_s', DEFAULT_QCS_CONFIG['fine_sweep_range_ps_per_s'])
         steps = float(alignment_options['coarse_steps'])
         if not np.isfinite(steps) or not steps.is_integer() or steps < 3:
             raise ValueError('sweep_num must be an integer of at least 3')
         alignment_options['coarse_steps'] = int(steps)
+        fine_steps = float(alignment_options['fine_steps'])
+        if not np.isfinite(fine_steps) or not fine_steps.is_integer() or fine_steps < 3:
+            raise ValueError('fine_steps must be an integer of at least 3')
+        alignment_options['fine_steps'] = int(fine_steps)
         init_bins = float(alignment_options['init_bin_number'])
         if not np.isfinite(init_bins) or not init_bins.is_integer() or init_bins < 2:
             raise ValueError('init_bin_number must be an integer of at least 2')
         alignment_options['init_bin_number'] = int(init_bins)
-        for name in ('sweep_range_ps_per_s', 'init_time_offset_range_ms'):
+        for name in ('sweep_range_ps_per_s', 'init_time_offset_range_ms',
+                     'fine_sweep_range_ps_per_s'):
             value = float(alignment_options[name])
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be positive and finite')
@@ -353,15 +367,26 @@ class RealtimeG2Controller:
             result.pop('t2_aligned_ps', None)
             result['start_time_offset_ps'] = offset_ps
             result['latency_ms'] = self.latency_ms
+            # Report the requested sum; offset_ps itself remains the residual
+            # correction applied to the already pre-aligned HH timestamps.
+            result['final_offset_ps'] = latency_ps + result['residual_offset_ps']
+            result['final_offset_ms'] = result['final_offset_ps'] * 1e-9
             result['ttx_start_time_us'] = int(t01_us)
             result['hh_start_time_us'] = t02_us
+            print(
+                f"QCS final alignment: skew={result['skew_ps_per_s']:+.3f} ps/s, "
+                f"final offset={result['final_offset_ms']:.9g} ms "
+                f"(latency {self.latency_ms:g} ms + residual "
+                f"{result['residual_offset_ps'] * 1e-6:.6g} us)",
+                flush=True,
+            )
             with self.lock:
                 self.timestamp_origins = origins
                 self.alignment_result = result
                 unique = result.get('unique_best_candidate', False)
                 self.initialization_status = (
                     f"Global sweep complete: correction {result['skew_ps_per_s']:.2f} ps/s, "
-                    f"offset {result['offset_ps'] * 1e-6:.6g} us" +
+                    f"final offset {result['final_offset_ms']:.9f} ms" +
                     ('' if unique else ' (tied candidates; skew unresolved)'))
         except Exception as exc:
             with self.lock:

@@ -1,11 +1,15 @@
 """Frequency estimation from sparse detections of a periodic pulse train."""
 
-import numpy as np
-from numba import njit
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import deque
+import os
 import time
 
+import numpy as np
+from numba import njit
 
-@njit
+
+@njit(nogil=True, cache=True)
 def _g2_counts_for_skew(first_ps, second_ps, second_elapsed_ps, edges_ps, skew):
     """Apply one skew and count delay pairs without the public wrapper overhead."""
     n_bins = len(edges_ps) - 1
@@ -44,6 +48,159 @@ def _g2_counts_for_skew(first_ps, second_ps, second_elapsed_ps, edges_ps, skew):
             j += 1
 
     return counts
+
+
+def _g2_sweep_histograms(first_ps, second_ps, second_elapsed_ps, edges_ps,
+                         candidates, workers):
+    """Yield independent candidate histograms in the original sweep order."""
+    if len(candidates) == 0:
+        return
+    workers = min(workers, len(candidates))
+    if workers == 1:
+        for skew in candidates:
+            yield _g2_counts_for_skew(
+                first_ps, second_ps, second_elapsed_ps, edges_ps, float(skew),
+            )
+        return
+
+    # Compile/load this signature before starting threads. Empty views avoid
+    # doing a real candidate twice; the cached kernel releases the GIL while
+    # each worker computes its own corrected timestamps and histogram.
+    _g2_counts_for_skew(
+        first_ps[:0], second_ps[:0], second_elapsed_ps[:0], edges_ps,
+        float(candidates[0]),
+    )
+    remaining = iter(candidates)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qcs-g2") as pool:
+        def submit(skew):
+            return pool.submit(
+                _g2_counts_for_skew, first_ps, second_ps, second_elapsed_ps,
+                edges_ps, float(skew),
+            )
+
+        pending = deque(submit(next(remaining)) for _ in range(workers))
+        while pending:
+            histogram = pending.popleft().result()
+            skew = next(remaining, None)
+            if skew is not None:
+                pending.append(submit(skew))
+            # Scoring in the caller stays ordered, including tie decisions
+            # and comparisons with the previous candidate's histogram.
+            yield histogram
+
+
+def _fft_delay_histogram_full(first_bin, second_bin, min_lag, max_lag):
+    """Reference implementation: correlate the complete binned records."""
+    from scipy import fft
+
+    n_time_bins = max(int(first_bin[-1]), int(second_bin[-1])) + 1
+    n_fft = fft.next_fast_len(2 * n_time_bins - 1, real=True)
+    first_hist = np.bincount(first_bin, minlength=n_time_bins).astype(np.float64)
+    first_spectrum = fft.rfft(first_hist, n=n_fft, workers=1)
+    del first_hist
+    second_hist = np.bincount(second_bin, minlength=n_time_bins).astype(np.float64)
+    second_spectrum = fft.rfft(second_hist, n=n_fft, workers=1)
+    del second_hist
+    np.conjugate(first_spectrum, out=first_spectrum)
+    np.multiply(second_spectrum, first_spectrum, out=second_spectrum)
+    del first_spectrum
+    correlation = fft.irfft(second_spectrum, n=n_fft, overwrite_x=True, workers=1)
+    del second_spectrum
+    lags = np.arange(min_lag, max_lag + 1, dtype=np.int64)
+    counts = np.rint(correlation[lags % n_fft]).astype(np.int64)
+    return counts, {
+        "method": "full", "workers": 1, "block_count": 1,
+        "block_bins": n_time_bins, "max_fft_points": n_fft,
+    }
+
+
+def _fft_delay_histogram_blocks(first_bin, second_bin, min_lag, max_lag,
+                                *, workers=None, block_bins=None):
+    """Sum exact limited-lag correlations over disjoint blocks of stream 1.
+
+    For a first-stream block [a, b), include stream 2 over
+    [a + min_lag, b + max_lag). Every pair belongs to exactly one first-stream
+    block, including pairs that cross a block boundary. A lag k then maps to
+    local correlation index k - min_lag, with no circular wraparound in the
+    retained indices when the FFT length is at least block_size + lag_span.
+    """
+    from scipy import fft
+
+    first_start, first_stop = int(first_bin[0]), int(first_bin[-1]) + 1
+    first_span = first_stop - first_start
+    lag_span = max_lag - min_lag
+    lag_count = lag_span + 1
+    if workers is None:
+        cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+        workers = min(8, cpu_count)
+        if first_span + lag_span < 262_144:
+            workers = 1
+    if block_bins is None:
+        # Aim for enough blocks to use the workers without excessive overlap.
+        # Keep individual transforms near 8 million points for ordinary ranges;
+        # a larger requested lag range necessarily raises this working size.
+        parts = min(workers, max(1, first_span // max(1, lag_span)))
+        desired_block = (first_span + parts - 1) // parts
+        block_limit = max(lag_span, 8_000_000 - lag_span)
+        block_bins = min(desired_block, max(1, block_limit))
+    block_count = (first_span + block_bins - 1) // block_bins
+    workers = min(workers, block_count)
+    counts = np.zeros(lag_count, dtype=np.int64)
+
+    def correlate_block(start):
+        stop = min(start + block_bins, first_stop)
+        i0, i1 = np.searchsorted(first_bin, (start, stop))
+        second_start = start + min_lag
+        second_stop = stop + max_lag
+        j0, j1 = np.searchsorted(second_bin, (second_start, second_stop))
+        if i0 == i1 or j0 == j1:
+            return None
+
+        size = stop - start
+        n_fft = fft.next_fast_len(size + lag_span, real=True)
+        first_hist = np.bincount(
+            first_bin[i0:i1] - start, minlength=size,
+        ).astype(np.float64)
+        first_spectrum = fft.rfft(first_hist, n=n_fft, workers=1)
+        del first_hist
+        second_hist = np.bincount(
+            second_bin[j0:j1] - second_start, minlength=size + lag_span,
+        ).astype(np.float64)
+        second_spectrum = fft.rfft(second_hist, n=n_fft, workers=1)
+        del second_hist
+        np.conjugate(first_spectrum, out=first_spectrum)
+        np.multiply(second_spectrum, first_spectrum, out=second_spectrum)
+        del first_spectrum
+        correlation = fft.irfft(second_spectrum, n=n_fft, overwrite_x=True, workers=1)
+        del second_spectrum
+        return np.rint(correlation[:lag_count]).astype(np.int64)
+
+    starts = iter(range(first_start, first_stop, block_bins))
+    if workers == 1:
+        for start in starts:
+            block_counts = correlate_block(start)
+            if block_counts is not None:
+                counts += block_counts
+    else:
+        # Bound pending work so completed histograms cannot accumulate in RAM.
+        # FFTs run in native code; threads share the read-only integer bin arrays.
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qcs-fft") as pool:
+            pending = {pool.submit(correlate_block, next(starts)) for _ in range(workers)}
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    block_counts = future.result()
+                    if block_counts is not None:
+                        counts += block_counts
+                    start = next(starts, None)
+                    if start is not None:
+                        pending.add(pool.submit(correlate_block, start))
+
+    return counts, {
+        "method": "blocks", "workers": workers, "block_count": block_count,
+        "block_bins": block_bins,
+        "max_fft_points": fft.next_fast_len(min(block_bins, first_span) + lag_span, real=True),
+    }
 
 
 def estimate_pulse_train_frequency(
@@ -197,11 +354,17 @@ def global_freq_alignment_g2(
     init_time_offset_range_ms=5.0,
     init_bin_number=500_000,
     min_init_overlap_fraction=0.1,
+    init_fft_method="blocks",
+    init_fft_workers=None,
+    init_fft_block_bins=None,
     sweep_range_ps_per_s=20000.0,
     sweep_center_ps_per_s=0.0,
     time_offset_range_ns=1000.0,
     max_bin_number=20_000,
-    coarse_steps=21,
+    coarse_steps=50,
+    fine_steps=20,
+    fine_sweep_range_ps_per_s=100.0,
+    sweep_workers=None,
     show_plot=False,
 ):
     """Estimate relative clock skew by sweeping a g2 delay histogram.
@@ -219,14 +382,29 @@ def global_freq_alignment_g2(
     sweep_range_ps_per_s`` to ``sweep_center_ps_per_s + sweep_range_ps_per_s``.
     Initialization and each trial apply their absolute correction to the
     original timestamps; the sweep does not apply the center correction twice.
+    A second sweep tests ``fine_steps`` equally spaced corrections within
+    ``+/-fine_sweep_range_ps_per_s`` of the coarse winner. The returned skew,
+    residual offset, and g2 histogram come from this fine sweep. The original
+    ``sweep_*`` diagnostic arrays describe the coarse stage; ``fine_sweep_*``
+    arrays describe the fine stage.
 
     Initialization uses FFT cross-correlation of coarse binned event streams.
+    By default, disjoint stream-1 blocks are correlated in parallel with
+    stream-2 margins covering the full requested delay interval. All block
+    histograms are summed before overlap normalization. ``init_fft_workers``
+    defaults to at most 8 available CPUs, and ``init_fft_block_bins`` defaults
+    to an automatic block length. Set ``init_fft_method="full"`` to use the
+    previous full-record FFT for comparison. The returned ``init_fft`` mapping
+    reports the method, worker count, block size, and largest transform length.
     Its lag-dependent counts are divided by the number of overlapping time
     bins; lags with less than ``min_init_overlap_fraction`` of the maximum
     possible overlap are excluded from peak selection.
     Each sweep trial applies a linear time correction while counting event
     pairs in a compiled loop. The candidate with the strongest peak above the
     histogram background is kept.
+    Candidate histograms use up to 8 CPU workers by default; set
+    ``sweep_workers=1`` for the serial path. Scoring and tie handling retain
+    the original candidate order. The compiled counter is cached between runs.
 
     The returned ``g2_histogram`` contains raw pair counts, not normalized
     g2 values. ``peak_score`` is a heuristic ranking of the largest bin; it
@@ -270,11 +448,17 @@ def global_freq_alignment_g2(
 
     sweep_range_ps_per_s = float(sweep_range_ps_per_s)
     sweep_center_ps_per_s = float(sweep_center_ps_per_s)
+    fine_sweep_range_ps_per_s = float(fine_sweep_range_ps_per_s)
     time_offset_range_ns = float(time_offset_range_ns)
     if not np.isfinite(sweep_range_ps_per_s) or sweep_range_ps_per_s <= 0:
         raise ValueError("sweep_range_ps_per_s must be finite and positive.")
     if not np.isfinite(sweep_center_ps_per_s):
         raise ValueError("sweep_center_ps_per_s must be finite.")
+    if not np.isfinite(fine_sweep_range_ps_per_s) or fine_sweep_range_ps_per_s <= 0:
+        raise ValueError("fine_sweep_range_ps_per_s must be finite and positive.")
+    if 1.0 + (sweep_center_ps_per_s - sweep_range_ps_per_s
+              - fine_sweep_range_ps_per_s) * 1e-12 <= 0.0:
+        raise ValueError("The frequency sweep corrections must preserve timestamp order.")
     init_range_was_scalar = np.isscalar(init_time_offset_range_ms)
     if init_range_was_scalar:
         range_value = float(init_time_offset_range_ms)
@@ -307,12 +491,29 @@ def global_freq_alignment_g2(
         raise ValueError("max_bin_number must be an integer of at least 2.")
     if int(coarse_steps) != coarse_steps or coarse_steps < 3:
         raise ValueError("coarse_steps must be an integer of at least 3.")
-    from scipy import fft as scipy_fft
+    if not np.isfinite(fine_steps) or int(fine_steps) != fine_steps or fine_steps < 3:
+        raise ValueError("fine_steps must be an integer of at least 3.")
+    if init_fft_method not in ("blocks", "full"):
+        raise ValueError('init_fft_method must be "blocks" or "full".')
+    for name, value in (("init_fft_workers", init_fft_workers),
+                        ("init_fft_block_bins", init_fft_block_bins),
+                        ("sweep_workers", sweep_workers)):
+        if value is not None and (
+            not np.isfinite(value) or int(value) != value or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer or None.")
+    if init_fft_workers is not None:
+        init_fft_workers = int(init_fft_workers)
+    if init_fft_block_bins is not None:
+        init_fft_block_bins = int(init_fft_block_bins)
+    if sweep_workers is None:
+        cpu_count = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+        sweep_workers = min(8, cpu_count)
+    sweep_workers = min(int(sweep_workers), max(int(coarse_steps), int(fine_steps)))
 
     # ------------------------------------------------------------------
     # 2. Sort timestamps and establish the shared relative time axis
     # ------------------------------------------------------------------
-    t0 = time.time()
     first = np.sort(first)
     second = np.sort(second)
     time_origin_ps = min(first[0], second[0])
@@ -328,38 +529,19 @@ def global_freq_alignment_g2(
         raise ValueError("Each timestamp array must span a positive duration.")
 
     acquisition_duration_s = duration_ps * 1e-12
-    print("step2: ", time.time() - t0)
 
     # ------------------------------------------------------------------
     # 3. Initialization: estimate the coarse t2 - t1 delay with an FFT
     # ------------------------------------------------------------------
-    t0 = time.time()
     init_min_ps = init_min_ms * 1e9
     init_max_ps = init_max_ms * 1e9
     init_bin_width_ps = (init_max_ps - init_min_ps) / int(init_bin_number)
     init_second_ps = second_ps + second_elapsed_ps * (sweep_center_ps_per_s * 1e-12)
-    # Coarsely bin both streams and compute their linear cross-correlation
-    # using FFTs. Padding to at least twice the time-grid length prevents
-    # circular wraparound; only delays within the requested initialization
-    # range are retained.
+    # Bin on the same global grid for both methods. Blocks include margins
+    # from stream 2 so pairs across block boundaries are retained exactly once.
     first_bin = np.floor(first_ps / init_bin_width_ps).astype(np.int64)
     second_bin = np.floor(init_second_ps / init_bin_width_ps).astype(np.int64)
     n_time_bins = max(int(first_bin.max()), int(second_bin.max())) + 1
-    # A linear correlation needs at least 2*n_time_bins - 1 points. Select
-    # SciPy's next efficient length instead of always rounding up to a power
-    # of two, and keep the spectra product in place to limit peak allocations.
-    n_fft = scipy_fft.next_fast_len(2 * n_time_bins - 1, real=True)
-    first_hist = np.bincount(first_bin, minlength=n_time_bins).astype(np.float64)
-    first_spectrum = scipy_fft.rfft(first_hist, n=n_fft)
-    del first_hist
-    second_hist = np.bincount(second_bin, minlength=n_time_bins).astype(np.float64)
-    second_spectrum = scipy_fft.rfft(second_hist, n=n_fft)
-    del second_hist
-    np.conjugate(first_spectrum, out=first_spectrum)
-    np.multiply(second_spectrum, first_spectrum, out=second_spectrum)
-    del first_spectrum
-    correlation_circular = scipy_fft.irfft(second_spectrum, n=n_fft, overwrite_x=True)
-    del second_spectrum
     min_lag_bin = max(int(np.ceil(init_min_ps / init_bin_width_ps)), -(n_time_bins - 1))
     max_lag_bin = min(int(np.floor(init_max_ps / init_bin_width_ps)), n_time_bins - 1)
     if min_lag_bin > max_lag_bin:
@@ -368,12 +550,16 @@ def global_freq_alignment_g2(
             "available correlation lags."
         )
     init_lag_bins = np.arange(min_lag_bin, max_lag_bin + 1, dtype=np.int64)
-    init_histogram = np.rint(
-        correlation_circular[np.mod(init_lag_bins, n_fft)]
-    ).astype(np.int64)
+    if init_fft_method == "blocks":
+        init_histogram, init_fft_info = _fft_delay_histogram_blocks(
+            first_bin, second_bin, min_lag_bin, max_lag_bin,
+            workers=init_fft_workers, block_bins=init_fft_block_bins,
+        )
+    else:
+        init_histogram, init_fft_info = _fft_delay_histogram_full(
+            first_bin, second_bin, min_lag_bin, max_lag_bin,
+        )
     init_centers_ps = init_lag_bins.astype(np.float64) * init_bin_width_ps
-    del correlation_circular
-    print("step3: ", time.time() - t0)
 
     # ------------------------------------------------------------------
     # 4. Correct for lag-dependent overlap and select the initial delay
@@ -381,7 +567,6 @@ def global_freq_alignment_g2(
     # Raw cross-correlation counts fall with lag when less of the two finite
     # records overlaps. Divide by the shared temporal support at each lag so
     # the edge envelope does not bias the selected initialization delay.
-    t0 = time.time()
     first_start, first_end = int(first_bin.min()), int(first_bin.max())
     second_start, second_end = int(second_bin.min()), int(second_bin.max())
     del first_bin, second_bin, init_second_ps
@@ -414,7 +599,6 @@ def global_freq_alignment_g2(
         int(max_bin_number) + 1,
         dtype=np.float64,
     )
-    print("step4: ", time.time() - t0)
 
     # ------------------------------------------------------------------
     # 5. Prepare the fine g2 histogram window around the initial delay
@@ -475,16 +659,13 @@ def global_freq_alignment_g2(
         max_count_changes = np.zeros(len(candidates), dtype=np.int64)
         previous_histogram = None
         best = None
-        for index, skew in enumerate(candidates):
+        histograms = _g2_sweep_histograms(
+            first_ps, second_ps, second_elapsed_ps, edges_ps,
+            candidates, sweep_workers,
+        )
+        for index, (skew, histogram) in enumerate(zip(candidates, histograms)):
             # Every trial starts with the original array, anchored at the
             # same reference event. No previous trial feeds into this one.
-            histogram = _g2_counts_for_skew(
-                first_ps,
-                second_ps,
-                second_elapsed_ps,
-                edges_ps,
-                float(skew),
-            )
             peak_index = int(np.argmax(histogram))
             peak = int(histogram[peak_index])
 
@@ -533,26 +714,37 @@ def global_freq_alignment_g2(
         )
 
     # ------------------------------------------------------------------
-    # 8. Run the coarse sweep and choose the best frequency correction
+    # 8. Run the coarse sweep to locate the fine-sweep center
     # ------------------------------------------------------------------
-    t0 = time.time()
     coarse_candidates = np.linspace(
         sweep_center_ps_per_s - sweep_range_ps_per_s,
         sweep_center_ps_per_s + sweep_range_ps_per_s,
         int(coarse_steps),
     ) * 1e-12
-    if np.any(1.0 + coarse_candidates <= 0.0):
-        raise ValueError("The frequency sweep corrections must preserve timestamp order.")
     (
         coarse_best, coarse_x, coarse_scores, changed_bins, max_count_changes,
         peak_counts, background_counts, peak_delays_ps,
     ) = sweep(coarse_candidates)
 
-    best = coarse_best
+    # ------------------------------------------------------------------
+    # 9. Refine the frequency correction around the coarse winner
+    # ------------------------------------------------------------------
+    fine_center_ps_per_s = coarse_best["skew"] * 1e12
+    fine_candidates = np.linspace(
+        fine_center_ps_per_s - fine_sweep_range_ps_per_s,
+        fine_center_ps_per_s + fine_sweep_range_ps_per_s,
+        int(fine_steps),
+    ) * 1e-12
+    (
+        best, fine_x, fine_scores, fine_changed_bins, fine_max_count_changes,
+        fine_peak_counts, fine_background_counts, fine_peak_delays_ps,
+    ) = sweep(fine_candidates)
+
     peak_delay_ps = float(edges_ps[best["peak_index"]]) + bin_width_ps / 2
     offset_ps = -peak_delay_ps
     t2_aligned_ps = second_ps + second_elapsed_ps * best["skew"] + offset_ps
-    tied_best = np.isclose(coarse_scores, best["score"], rtol=1e-12, atol=1e-12)
+    tied_best = np.isclose(fine_scores, best["score"], rtol=1e-12, atol=1e-12)
+    coarse_tied_best = np.isclose(coarse_scores, coarse_best["score"], rtol=1e-12, atol=1e-12)
     unique_best_candidate = np.count_nonzero(tied_best) == 1
     tied_message = (
         f"; {np.count_nonzero(tied_best)} candidates tie, so the result is not unique"
@@ -560,16 +752,15 @@ def global_freq_alignment_g2(
         else ""
     )
     print(
-        f"g2 sweep complete: skew={best['skew'] * 1e12:+.3f} ps/s, "
+        f"g2 fine sweep complete: skew={best['skew'] * 1e12:+.3f} ps/s, "
         f"peak delay={peak_delay_ps * 1e-3:.6f} ns, "
         f"peak={best['peak']:,}, background={best['background']:.3f}, "
         f"score={best['score']:.3f}{tied_message}",
         flush=True,
     )
-    print("step8: ", time.time() - t0)
 
     # ------------------------------------------------------------------
-    # 9. Optionally plot the selected g2 histogram and sweep scores
+    # 10. Optionally plot the selected g2 histogram and both sweeps
     # ------------------------------------------------------------------
     if show_plot:
         import matplotlib.pyplot as plt
@@ -590,26 +781,27 @@ def global_freq_alignment_g2(
         final_hist_axis.grid(True, alpha=0.3)
         final_hist_axis.legend()
 
-        final_score_axis.plot(coarse_x * 1e12, coarse_scores, ".-")
+        final_score_axis.plot(coarse_x * 1e12, coarse_scores, ".-", label="Coarse", zorder=2)
+        final_score_axis.plot(fine_x * 1e12, fine_scores, ".-", label="Fine", zorder=3)
         final_score_axis.axvline(
-            best["skew"] * 1e12, color="tab:red", linestyle="--", label="Selected skew"
+            best["skew"] * 1e12, color="tab:red", linestyle="--", label="Selected skew", zorder=1
         )
-        final_score_axis.set_title("Completed coarse sweep")
+        final_score_axis.set_title("Coarse and fine sweeps")
         final_score_axis.set_xlabel("Applied skew (ps/s)")
         final_score_axis.set_ylabel("Peak score")
         final_score_axis.grid(True, alpha=0.3)
         final_score_axis.legend()
         final_figure.tight_layout()
         plt.show()
-
     # ------------------------------------------------------------------
-    # 10. Return alignment, histogram, and diagnostic data
+    # 11. Return the fine alignment and diagnostics from both sweeps
     # ------------------------------------------------------------------
     return {
         "skew_s_per_s": best["skew"],
         "skew_ps_per_s": best["skew"] * 1e12,
         "skew_ppm": best["skew"] * 1e6,
         "offset_ps": offset_ps,
+        "residual_offset_ps": offset_ps,
         "t2_aligned_ps": t2_aligned_ps,
         "bin_centers_ns": bin_centers_ns,
         "g2_histogram": best["histogram"],
@@ -630,6 +822,7 @@ def global_freq_alignment_g2(
         "init_peak_delay_ps": init_peak_delay_ps,
         "init_bin_width_ps": init_bin_width_ps,
         "init_bin_number": int(init_bin_number),
+        "init_fft": init_fft_info,
         "init_bin_centers_ns": init_centers_ps * 1e-3,
         "init_g2_histogram": init_histogram,
         "init_g2_overlap_normalized": normalized_init_histogram,
@@ -637,10 +830,27 @@ def global_freq_alignment_g2(
         "init_min_overlap_fraction": min_init_overlap_fraction,
         "sweep_delay_range_ps": np.array([edges_ps[0], edges_ps[-1]]),
         "sweep_skew_ps_per_s": coarse_x * 1e12,
+        "sweep_workers": min(sweep_workers, int(coarse_steps)),
         "sweep_scores": coarse_scores,
+        "coarse_best_skew_ps_per_s": fine_center_ps_per_s,
+        "coarse_peak_score": coarse_best["score"],
+        "coarse_tied_best_skew_ps_per_s": coarse_x[coarse_tied_best] * 1e12,
+        "coarse_unique_best_candidate": bool(np.count_nonzero(coarse_tied_best) == 1),
+        "fine_steps": int(fine_steps),
+        "fine_sweep_range_ps_per_s": fine_sweep_range_ps_per_s,
+        "fine_sweep_center_ps_per_s": fine_center_ps_per_s,
+        "fine_sweep_skew_ps_per_s": fine_x * 1e12,
+        "fine_sweep_scores": fine_scores,
+        "fine_sweep_workers": min(sweep_workers, int(fine_steps)),
+        "fine_sweep_changed_bins": fine_changed_bins,
+        "fine_sweep_max_count_change": fine_max_count_changes,
+        "fine_sweep_peak_counts": fine_peak_counts,
+        "fine_sweep_background_counts": fine_background_counts,
+        "fine_sweep_peak_delays_ps": fine_peak_delays_ps,
+        "fine_sweep_last_tag_corrections_ps": fine_x * second_elapsed_ps[-1],
         "sweep_changed_bins": changed_bins,
         "sweep_max_count_change": max_count_changes,
-        "tied_best_skew_ps_per_s": coarse_x[tied_best] * 1e12,
+        "tied_best_skew_ps_per_s": fine_x[tied_best] * 1e12,
         "unique_best_candidate": bool(unique_best_candidate),
         "sweep_peak_counts": peak_counts,
         "sweep_background_counts": background_counts,
@@ -688,15 +898,19 @@ def plot_global_freq_alignment_result(result):
 
     score_axis.axvline(float(result['skew_ps_per_s']), color='tab:red', linestyle='--',
                        label='Selected skew', zorder=1)
-    score_axis.plot(sweep_skew, sweep_scores, '.-', zorder=2)
-    score_axis.set_title('Completed coarse sweep')
+    score_axis.plot(sweep_skew, sweep_scores, '.-', label='Coarse', zorder=2)
+    if 'fine_sweep_scores' in result:
+        score_axis.plot(result['fine_sweep_skew_ps_per_s'], result['fine_sweep_scores'],
+                        '.-', label='Fine', zorder=3)
+    score_axis.set_title('Coarse and fine sweeps')
     score_axis.set_xlabel('Applied skew (ps/s)')
     score_axis.set_ylabel('Peak score')
     score_axis.grid(True, alpha=0.3)
     score_axis.legend()
-    figure.suptitle(
-        f"Global frequency alignment: {float(result['skew_ps_per_s']):+.3f} ps/s"
-    )
+    title = f"Global frequency alignment: {float(result['skew_ps_per_s']):+.3f} ps/s"
+    if 'final_offset_ms' in result:
+        title += f"; final offset {float(result['final_offset_ms']):.9g} ms"
+    figure.suptitle(title)
     figure.tight_layout()
     plt.show(block=False)
     return figure

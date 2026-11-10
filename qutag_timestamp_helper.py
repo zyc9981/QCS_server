@@ -231,6 +231,8 @@ def open_qutag_timestamp_window(app):
     screen_height = app.qutag_timestamp_win.winfo_screenheight()
     app.qutag_timestamp_win.geometry(f"{screen_width}x{screen_height}+0+0")
     app.qutag_timestamp_win.minsize(1100, 700)
+    app.qutag_timestamp_win.grid_columnconfigure(0, weight=1)
+    app.qutag_timestamp_win.grid_rowconfigure(0, weight=1)
     _style_window(app, app.qutag_timestamp_win)
     app.qutag_timestamp_writing = False
     app.qutag_timestamp_preparing_hydraharp = False
@@ -317,7 +319,7 @@ def open_qutag_timestamp_window(app):
     app.time_tagger_file_writer = None
 
     content = _frame(app, app.qutag_timestamp_win)
-    content.pack(fill="both", expand=True, padx=10, pady=(10, 6))
+    content.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
     content.grid_columnconfigure(0, weight=1, uniform="timestamp_layout")
     content.grid_columnconfigure(1, weight=1, uniform="timestamp_layout")
     content.grid_rowconfigure(0, weight=1, uniform="timestamp_rows")
@@ -339,17 +341,17 @@ def open_qutag_timestamp_window(app):
     tracking_panel = _frame(app, qcs_panel, surface=True)
     tracking_panel.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
     _label(app, init_panel, text="QCS initialization").grid(
-        row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 4))
+        row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4))
 
     def qcs_parameter(parent, label, variable_name, entry_name, saved_name, default,
                       row_index, column_index):
-        # Keep three compact label/entry groups on each parameter row.
+        # Stack each label above its entry in a shared four-column grid.
         group = _frame(app, parent)
-        group.grid(row=row_index, column=column_index, sticky="ew", padx=4, pady=2)
+        group.grid(row=row_index, column=column_index, sticky="ew", padx=5, pady=(6, 6))
         group.grid_columnconfigure(0, weight=1)
-        _label(app, group, text=label).grid(row=0, column=0, sticky="w")
+        _label(app, group, text=label).grid(row=0, column=0, sticky="w", pady=(0, 3))
         initial_value = getattr(app, saved_name, default)
-        if variable_name in ("qcs_sweep_num_var", "qcs_init_bin_number_var"):
+        if variable_name in ("qcs_sweep_num_var", "qcs_init_bin_number_var", "qcs_fine_steps_var"):
             try:
                 initial_value = str(_qcs_integer_value(initial_value, label))
             except ValueError:
@@ -359,48 +361,55 @@ def open_qutag_timestamp_window(app):
         entry = _entry(app, group, textvariable=var, width=9)
         entry.configure(bg="white", fg="black", insertbackground="black",
                         disabledbackground="white", disabledforeground="#666666")
-        entry.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        entry.grid(row=1, column=0, sticky="ew")
         setattr(app, entry_name, entry)
 
-    for column in range(3):
+    for column in range(4):
         init_panel.grid_columnconfigure(column, weight=1, uniform="qcs_init_parameters")
-    qcs_parameter(init_panel, "T_acq_init", "qcs_init_interval_var",
+
+    qcs_parameter(init_panel, "init_Ta_s", "qcs_init_interval_var",
                   "qcs_init_interval_entry", "qcs_init_interval_text",
                   f"{DEFAULT_QCS_CONFIG['init_interval_s']:g}", 1, 0)
-    qcs_parameter(init_panel, "sweep_range_ps_s", "qcs_sweep_range_var",
-                  "qcs_sweep_range_entry", "qcs_sweep_range_text",
-                  f"{DEFAULT_QCS_CONFIG['sweep_range_ps_per_s']:g}", 1, 1)
-    qcs_parameter(init_panel, "sweep_num", "qcs_sweep_num_var",
-                  "qcs_sweep_num_entry", "qcs_sweep_num_text",
-                  str(DEFAULT_QCS_CONFIG['coarse_steps']), 1, 2)
-    qcs_parameter(init_panel, "offset_range_init_ms", "qcs_offset_range_var",
-                  "qcs_offset_range_entry", "qcs_offset_range_text",
-                  f"{DEFAULT_QCS_CONFIG['init_time_offset_range_ms']:g}", 2, 0)
-    qcs_parameter(init_panel, "init_bin_number", "qcs_init_bin_number_var",
-                  "qcs_init_bin_number_entry", "qcs_init_bin_number_text",
-                  str(DEFAULT_QCS_CONFIG['init_bin_number']), 2, 1)
+    qcs_parameter(init_panel, "Ta_s", "qcs_interval_var",
+                  "qcs_interval_entry", "qcs_interval_text",
+                  f"{DEFAULT_QCS_CONFIG['acquisition_interval_s']:g}", 1, 1)
     qcs_parameter(init_panel, "latency_ms", "qcs_latency_ms_var",
                   "qcs_latency_ms_entry", "qcs_latency_ms_text",
-                  f"{DEFAULT_QCS_CONFIG['latency_ms']:g}", 2, 2)
+                  f"{DEFAULT_QCS_CONFIG['latency_ms']:g}", 1, 2)
+    qcs_parameter(init_panel, "init_tau_range_ms", "qcs_offset_range_var",
+                  "qcs_offset_range_entry", "qcs_offset_range_text",
+                  f"{DEFAULT_QCS_CONFIG['init_time_offset_range_ms']:g}", 1, 3)
+
+    qcs_parameter(init_panel, "init_bin_num", "qcs_init_bin_number_var",
+                  "qcs_init_bin_number_entry", "qcs_init_bin_number_text",
+                  str(DEFAULT_QCS_CONFIG['init_bin_number']), 2, 0)
+    qcs_parameter(init_panel, "coarse_range", "qcs_sweep_range_var",
+                  "qcs_sweep_range_entry", "qcs_sweep_range_text",
+                  f"{DEFAULT_QCS_CONFIG['sweep_range_ps_per_s']:g}", 2, 1)
+    qcs_parameter(init_panel, "coarse_steps", "qcs_sweep_num_var",
+                  "qcs_sweep_num_entry", "qcs_sweep_num_text",
+                  str(DEFAULT_QCS_CONFIG['coarse_steps']), 2, 2)
+    qcs_parameter(init_panel, "fine_steps", "qcs_fine_steps_var",
+                  "qcs_fine_steps_entry", "qcs_fine_steps_text",
+                  str(DEFAULT_QCS_CONFIG['fine_steps']), 2, 3)
+
     app.qcs_initialization_var = StringVar(value="Waiting for initialization")
     init_label = _label(app, init_panel, textvariable=app.qcs_initialization_var)
     init_label.configure(wraplength=500, justify="left")
-    init_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=4)
+    init_label.grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=4)
 
     _label(app, tracking_panel, text="QCS live tracking").grid(
         row=0, column=0, sticky="w", padx=12, pady=(8, 4))
     tracking_panel.grid_columnconfigure(0, weight=1)
-    qcs_parameter(tracking_panel, "T_acq_s", "qcs_interval_var",
-                  "qcs_interval_entry", "qcs_interval_text",
-                  f"{DEFAULT_QCS_CONFIG['acquisition_interval_s']:g}", 1, 0)
     app.qcs_status_var = StringVar(value="Idle — enable Internet and wait for the remote node")
     app.qcs_counts_var = StringVar(value="Time Tagger X: 0 events | HydraHarp: 0 events")
     app.qcs_quality_var = StringVar(value="Data quality: waiting for a completed interval")
-    for variable in (app.qcs_status_var, app.qcs_counts_var, app.qcs_quality_var):
+    for row, variable in enumerate(
+        (app.qcs_status_var, app.qcs_counts_var, app.qcs_quality_var), start=1
+    ):
         label = _label(app, tracking_panel, textvariable=variable)
         label.configure(wraplength=500, justify="left")
-        label.grid(row=2 + len(tracking_panel.grid_slaves(row=2)),
-                   column=0, sticky="w", padx=12, pady=3)
+        label.grid(row=row, column=0, sticky="w", padx=12, pady=3)
 
     figure = Figure(figsize=(4.8, 2.7), dpi=100)
     axis = figure.add_subplot(111)
@@ -616,7 +625,7 @@ def open_qutag_timestamp_window(app):
     _label(app, limit_frame, text="s", fg=_ui(app)["muted"]).pack(side="left")
 
     button_frame = _frame(app, app.qutag_timestamp_win, surface=True)
-    button_frame.pack(fill="x", padx=10, pady=(0, 10))
+    button_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     app.qutag_timestamp_start_writing_button = _button(
         app,
@@ -688,20 +697,24 @@ def _start_qcs(app):
     try:
         interval = float(app.qcs_interval_var.get())
         sweep_num = _qcs_integer_value(app.qcs_sweep_num_var.get(), "sweep_num")
+        fine_steps = _qcs_integer_value(app.qcs_fine_steps_var.get(), "fine_steps")
         init_bin_number = _qcs_integer_value(
             app.qcs_init_bin_number_var.get(), "init_bin_number")
         app.qcs_sweep_num_var.set(str(sweep_num))
+        app.qcs_fine_steps_var.set(str(fine_steps))
         app.qcs_init_bin_number_var.set(str(init_bin_number))
         controller = RealtimeG2Controller(app, {'acquisition_interval_s': interval,
                                                    'init_interval_s': float(app.qcs_init_interval_var.get()),
                                                    'latency_ms': float(app.qcs_latency_ms_var.get()),
                                                    'global_alignment_kwargs': {
                                                        'coarse_steps': sweep_num,
+                                                       'fine_steps': fine_steps,
                                                        'sweep_range_ps_per_s': float(app.qcs_sweep_range_var.get()),
                                                        'init_time_offset_range_ms': float(app.qcs_offset_range_var.get()),
                                                        'init_bin_number': init_bin_number}})
         app.qcs_sweep_range_text = app.qcs_sweep_range_var.get()
         app.qcs_sweep_num_text = app.qcs_sweep_num_var.get()
+        app.qcs_fine_steps_text = app.qcs_fine_steps_var.get()
         app.qcs_offset_range_text = app.qcs_offset_range_var.get()
         app.qcs_init_bin_number_text = app.qcs_init_bin_number_var.get()
         app.qcs_latency_ms_text = app.qcs_latency_ms_var.get()
@@ -769,6 +782,7 @@ def _poll_qcs(app):
                                    + ". Network session SHA-256 verified; remote device loss is not certified.")
     app.qcs_sweep_range_entry.configure(state="disabled" if busy else "normal")
     app.qcs_sweep_num_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_fine_steps_entry.configure(state="disabled" if busy else "normal")
     app.qcs_offset_range_entry.configure(state="disabled" if busy else "normal")
     app.qcs_init_bin_number_entry.configure(state="disabled" if busy else "normal")
     app.qcs_latency_ms_entry.configure(state="disabled" if busy else "normal")

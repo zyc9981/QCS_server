@@ -87,7 +87,6 @@ UI = {
 }
 
 
-
 class App(TxCommandsMixin, RxCommandsMixin):
     def __init__(self):
         self.ui = UI

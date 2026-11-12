@@ -450,7 +450,7 @@ def open_qutag_timestamp_window(app):
     (app.qutag_timestamp_tau_line,) = placeholder_axis.plot([], [], color="tab:blue", lw=1.2)
     app.qutag_timestamp_tau_controller = None
     app.qutag_timestamp_tau_version = -1
-    placeholder_figure.subplots_adjust(left=0.08, right=0.985, bottom=0.12, top=0.92)
+    placeholder_figure.subplots_adjust(left=0.16, right=0.985, bottom=0.12, top=0.92)
     app.qutag_timestamp_placeholder_axis = placeholder_axis
     app.qutag_timestamp_placeholder_canvas = FigureCanvasTkAgg(
         placeholder_figure, master=placeholder_plot_frame
@@ -706,6 +706,7 @@ def _start_qcs(app):
         app.qcs_fine_steps_var.set(str(fine_steps))
         app.qcs_init_bin_number_var.set(str(init_bin_number))
         controller = RealtimeG2Controller(app, {'acquisition_interval_s': interval,
+                                                   'live_clock_adjustment_enabled': True,
                                                    'init_interval_s': float(app.qcs_init_interval_var.get()),
                                                    'latency_ms': float(app.qcs_latency_ms_var.get()),
                                                    'global_alignment_kwargs': {

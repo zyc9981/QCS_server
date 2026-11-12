@@ -17,7 +17,7 @@ DEFAULT_QCS_CONFIG = {
     'init_interval_s': 2.0,
     'acquisition_interval_s': 1.0,
 
-    'latency_ms': 350.0,
+    'latency_ms': 400.0,
     'init_time_offset_range_ms': 40.0,
     'init_bin_number': 1_000_000,
 
@@ -178,7 +178,7 @@ class RealtimeG2Controller:
         if not np.isfinite(self.latency_ms) or self.latency_ms < 0:
             raise ValueError('latency_ms must be a nonnegative finite number')
         self.live_clock_adjustment_enabled = (
-            self.config.get('live_clock_adjustment_enabled', False) is True
+            self.config.get('live_clock_adjustment_enabled', True) is True
         )
         alignment_options = dict(self.config.get('global_alignment_kwargs', {}))
         alignment_options.setdefault(
@@ -641,7 +641,7 @@ class RealtimeG2Controller:
             raise ValueError("Live interval midpoint did not advance")
         state["u0"] = (fit["center"] - state["tau_ps"]) / elapsed_mid_ps
         state["tau_ps"] = fit["center"]
-        print(state["tau_ps"])
+        # print(state["tau_ps"])
         state["tau_rt_ps"] = fit_rt["center"]
         state["epsilon_ps"] = state["tau_ps"] - state["tau_rt_ps"] / 2
         state["T_lastmid_ps"] = T_mid_ps
@@ -717,8 +717,8 @@ class RealtimeG2Controller:
                     continue
 
                 # The remote node accepts an absolute correction relative to
-                # nominal. u0 is measured drift, so cancel it against the
-                # currently applied setpoint.
+                # nominal. Apply the opposite of measured u0 as a delta while
+                # retaining the global-alignment setpoint already in effect.
                 target_ps_per_s = (
                     float(self.current_clock_setpoint_ps_per_s) - residual_drift_ps_per_s
                 )

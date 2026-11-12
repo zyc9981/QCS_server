@@ -20,6 +20,9 @@ class InternetCoordinator:
         self.commands = queue.Queue()
         self.closed = threading.Event()
         self.sockets = set()
+        self.control_connected = False
+        self.connection_generation = 0
+        self.clock_adjustment_supported = False
         self.ready = False
         self.active = False
         self.session = None
@@ -30,6 +33,7 @@ class InternetCoordinator:
         self.finished = None
         self.remote_start_time_us = None
         self.remote_start_monotonic_us = None
+        self.clock_commands = {}
         self.status = 'Starting Internet listener...'
         self.thread = threading.Thread(target=self._run, name='internet-control', daemon=True)
         self.thread.start()
@@ -40,7 +44,72 @@ class InternetCoordinator:
                         bytes=self.bytes_saved, blocks=self.blocks, started=self.started,
                         finished=self.finished, remote_start_time_us=self.remote_start_time_us,
                         remote_start_monotonic_us=self.remote_start_monotonic_us,
+                        control_connected=self.control_connected,
+                        clock_adjustment_supported=self.clock_adjustment_supported,
+                        clock_commands={key: dict(value) for key, value in self.clock_commands.items()},
                         status=self.status)
+
+    def set_clock_correction(self, correction_ps_per_s):
+        """Queue a clock correction over the persistent Windows control connection.
+
+        Returns a command ID. Check get_clock_command() for the asynchronous result.
+        """
+        try:
+            correction = float(correction_ps_per_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('Clock correction must be a finite number in ps/s') from exc
+        if not math.isfinite(correction):
+            raise ValueError('Clock correction must be a finite number in ps/s')
+
+        command_id = uuid.uuid4().hex
+        with self.lock:
+            if not self.control_connected:
+                raise RuntimeError('Windows control connection is not connected')
+            if not self.clock_adjustment_supported:
+                raise RuntimeError('Windows node has not advertised clock-adjustment support')
+            # Retain a bounded history of recent command results.
+            while len(self.clock_commands) >= 64:
+                oldest_terminal = next((key for key, item in self.clock_commands.items()
+                                        if item['status'] in ('applied', 'failed', 'timed_out',
+                                                              'connection_lost')),
+                                       None)
+                if oldest_terminal is None:
+                    raise RuntimeError('Too many clock commands are awaiting results')
+                del self.clock_commands[oldest_terminal]
+            generation = self.connection_generation
+            self.clock_commands[command_id] = {
+                'command_id': command_id,
+                'correction_ps_per_s': correction,
+                'status': 'queued',
+                'created_monotonic': time.monotonic(),
+                'connection_generation': generation,
+                'result': None,
+            }
+            self.commands.put(('set_clock', (command_id, correction, generation)))
+        return command_id
+
+    def get_clock_command(self, command_id):
+        """Return the queued/sent state and remote result for one command."""
+        with self.lock:
+            command = self.clock_commands.get(command_id)
+            return dict(command) if command is not None else None
+
+    def _fail_clock_commands(self, generation, status, message):
+        with self.lock:
+            for command in self.clock_commands.values():
+                if (command['connection_generation'] == generation
+                        and command['status'] in ('queued', 'sent')):
+                    command['status'] = status
+                    command['message'] = message
+
+    def _expire_clock_commands(self):
+        now = time.monotonic()
+        with self.lock:
+            for command in self.clock_commands.values():
+                if (command['status'] == 'sent'
+                        and now - command['sent_monotonic'] >= self.timeout):
+                    command['status'] = 'timed_out'
+                    command['message'] = 'No CLOCK_RESULT received before the control timeout'
 
     def record(self, output, duration=3600, max_bytes=16 * 1024**3):
         if not math.isfinite(duration) or not 0.001 <= duration <= 3600:
@@ -225,6 +294,10 @@ class InternetCoordinator:
                         conn, _ = server.accept()
                         self._track(conn)
                         conn.settimeout(self.timeout)
+                        with self.lock:
+                            self.connection_generation += 1
+                            self.control_connected = True
+                            self.clock_adjustment_supported = False
                     except socket.timeout:
                         continue
                 try:
@@ -238,10 +311,42 @@ class InternetCoordinator:
                         self._begin_memory(conn, values)
                     elif kind == 'stop':
                         send_json(conn, dict(type='STOP', id=values))
+                    elif kind == 'set_clock':
+                        command_id, correction, generation = values
+                        with self.lock:
+                            command = self.clock_commands.get(command_id)
+                            can_send = (self.control_connected
+                                        and generation == self.connection_generation
+                                        and command is not None
+                                        and command['status'] == 'queued')
+                            if can_send:
+                                command['status'] = 'sent'
+                                command['sent_monotonic'] = time.monotonic()
+                        if can_send:
+                            send_json(conn, {
+                                'type': 'SET_CLOCK',
+                                'command_id': command_id,
+                                'correction_ps_per_s': correction,
+                            })
+                        else:
+                            self._fail_clock_commands(
+                                generation, 'connection_lost',
+                                'Control connection changed before command was sent')
+                    self._expire_clock_commands()
                     if not select.select([conn], [], [], 0.1)[0]:
                         continue
                     msg = read_json(conn)
-                    if msg.get('type') == 'ACQ_STARTED':
+                    if msg.get('type') == 'CLOCK_RESULT':
+                        command_id = msg.get('command_id')
+                        with self.lock:
+                            command = self.clock_commands.get(command_id)
+                            if command is not None:
+                                command['status'] = 'applied' if msg.get('success') is True else 'failed'
+                                command['result'] = msg
+                                command.pop('message', None)
+                            else:
+                                self.status = f'Received unmatched clock result: {command_id}'
+                    elif msg.get('type') == 'ACQ_STARTED':
                         with self.lock:
                             if msg.get('id') == self.session:
                                 self.remote_start_time_us = msg.get('start_time_us')
@@ -257,6 +362,11 @@ class InternetCoordinator:
                     with self.lock:
                         if msg.get('type') == 'READY':
                             self.ready = True
+                            capabilities = msg.get('capabilities', [])
+                            self.clock_adjustment_supported = (
+                                isinstance(capabilities, list)
+                                and 'set_clock_correction_v1' in capabilities
+                            )
                             if not self.active and self.result is None:
                                 self.status = 'Internet ready; Windows service connected'
                         elif msg.get('type') == 'BUSY':
@@ -264,8 +374,14 @@ class InternetCoordinator:
                         elif msg.get('type') in ('ERROR', 'DUPLICATE'):
                             raise RuntimeError(msg.get('message', str(msg)))
                 except Exception as exc:
+                    with self.lock:
+                        generation = self.connection_generation
+                        self.control_connected = False
+                        self.clock_adjustment_supported = False
                     conn.close()
                     conn = None
+                    self._fail_clock_commands(
+                        generation, 'connection_lost', f'Control connection failed: {exc}')
                     with self.lock:
                         self.ready = False
                         self.status = f'Internet control error: {exc}'
@@ -279,4 +395,9 @@ class InternetCoordinator:
             with self.lock:
                 self.status = f'Internet listener error: {exc}'
         finally:
+            with self.lock:
+                generation = self.connection_generation
+                self.control_connected = False
+                self.clock_adjustment_supported = False
+            self._fail_clock_commands(generation, 'connection_lost', 'Coordinator closed')
             self.close()

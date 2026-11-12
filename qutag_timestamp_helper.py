@@ -305,6 +305,8 @@ def open_qutag_timestamp_window(app):
     app.qutag_lock_initial_voltage = None
     app.qutag_lock_start_voltage = None
     app.qutag_lock_peak_voltage = None
+    from qutag_piezoscan_helper import load_latest_qutag_piezoscan_csv
+    load_latest_qutag_piezoscan_csv(app)
     app.qutag_timestamp_written_path = None
     app.qutag_timestamp_size_poll_active = False
     app.qutag_timestamp_duration_limit_s = None
@@ -402,10 +404,9 @@ def open_qutag_timestamp_window(app):
         row=0, column=0, sticky="w", padx=12, pady=(8, 4))
     tracking_panel.grid_columnconfigure(0, weight=1)
     app.qcs_status_var = StringVar(value="Idle — enable Internet and wait for the remote node")
-    app.qcs_counts_var = StringVar(value="Time Tagger X: 0 events | HydraHarp: 0 events")
-    app.qcs_quality_var = StringVar(value="Data quality: waiting for a completed interval")
+    app.qcs_quality_var = StringVar(value="Live step: waiting for a completed interval")
     for row, variable in enumerate(
-        (app.qcs_status_var, app.qcs_counts_var, app.qcs_quality_var), start=1
+        (app.qcs_status_var, app.qcs_quality_var), start=1
     ):
         label = _label(app, tracking_panel, textvariable=variable)
         label.configure(wraplength=500, justify="left")
@@ -443,11 +444,12 @@ def open_qutag_timestamp_window(app):
     placeholder_figure = Figure(figsize=(4.8, 2.7), dpi=100)
     placeholder_axis = placeholder_figure.add_subplot(111)
     _style_plot(app, placeholder_figure, placeholder_axis)
-    placeholder_axis.set_title("Plot")
-    placeholder_axis.set_xlabel("Time (s)")
-    placeholder_axis.set_ylabel("Counts")
-    placeholder_axis.set_xlim(0, app.qutag_timestamp_plot_window_s)
-    placeholder_axis.set_ylim(0, 4096)
+    placeholder_axis.set_title("Live QCS time offset")
+    placeholder_axis.set_xlabel("Elapsed time (s)")
+    placeholder_axis.set_ylabel("tau_ps (ps)")
+    (app.qutag_timestamp_tau_line,) = placeholder_axis.plot([], [], color="tab:blue", lw=1.2)
+    app.qutag_timestamp_tau_controller = None
+    app.qutag_timestamp_tau_version = -1
     placeholder_figure.subplots_adjust(left=0.08, right=0.985, bottom=0.12, top=0.92)
     app.qutag_timestamp_placeholder_axis = placeholder_axis
     app.qutag_timestamp_placeholder_canvas = FigureCanvasTkAgg(
@@ -735,31 +737,72 @@ def _stop_qcs(app):
 
 
 def _poll_qcs(app):
+    """Run one GUI poll and always schedule the next poll while the window lives."""
+    window = getattr(app, "qutag_timestamp_win", None)
+    if window is None or not window.winfo_exists():
+        return
+    try:
+        _poll_qcs_once(app)
+    except Exception as exc:
+        # Keep the Tk event loop and subsequent QCS status updates alive if
+        # one display update encounters malformed or temporarily empty data.
+        print(f"QCS GUI update failed: {exc}", flush=True)
+    window = getattr(app, "qutag_timestamp_win", None)
+    if window is not None and window.winfo_exists():
+        window.after(100, lambda: _poll_qcs(app))
+
+
+def _poll_qcs_once(app):
     window = getattr(app, "qutag_timestamp_win", None)
     if window is None or not window.winfo_exists():
         return
     controller = getattr(app, "qcs_controller", None)
     busy = controller is not None and controller.busy
     if controller is not None:
+        if app.qutag_timestamp_tau_controller is not controller:
+            app.qutag_timestamp_tau_controller = controller
+            app.qutag_timestamp_tau_version = -1
+            app.qutag_timestamp_tau_line.set_data([], [])
+            app.qutag_timestamp_placeholder_axis.set_xlim(0, 1)
+            app.qutag_timestamp_placeholder_axis.set_ylim(-1, 1)
+            app.qutag_timestamp_placeholder_axis.set_autoscaley_on(True)
+            app.qutag_timestamp_placeholder_canvas.draw_idle()
+        version, tau_time_s, tau_ps = controller.tau_history_snapshot(
+            app.qutag_timestamp_tau_version)
+        if tau_time_s is not None and tau_time_s.size:
+            app.qutag_timestamp_tau_version = version
+            app.qutag_timestamp_tau_line.set_data(tau_time_s, tau_ps)
+            axis = app.qutag_timestamp_placeholder_axis
+            axis.relim()
+            axis.set_autoscaley_on(True)
+            axis.autoscale_view(scalex=False, scaley=True)
+            axis.set_xlim(0, max(float(tau_time_s[-1]), 1.0))
+            app.qutag_timestamp_placeholder_canvas.draw_idle()
         update = controller.poll_update()
         if update is not None:
             app.qcs_status_var.set(update['status'])
-            app.qcs_initialization_var.set(update['initialization_status'])
-            quality = update.get('quality')
-            if quality is not None:
-                reasons = '; '.join(quality['reasons']) or 'Required channels populated; arrays chronological'
-                app.qcs_quality_var.set(f"Interval {quality['sequence']}: {quality['status']} — {reasons}. "
-                                        + quality['network'])
+            initialization_status = update['initialization_status']
+            clock_command = update.get('clock_command')
+            if clock_command and clock_command['status'] in (
+                'applied', 'failed', 'timed_out', 'connection_lost'
+            ):
+                status_prefix = initialization_status.partition(' | command: ')[0]
+                command_id = clock_command.get('command_id')
+                command_label = clock_command['status']
+                if command_id is not None:
+                    command_label += f" #{command_id}"
+                initialization_status = f"{status_prefix} | command: {command_label}"
+            app.qcs_initialization_var.set(initialization_status)
+            live_step = update.get('live_step_result')
+            if live_step is not None:
+                app.qcs_quality_var.set(
+                    f"Interval {live_step['sequence']} | "
+                    f"u0 {live_step['u0_ps_per_s']:+.3f} ps/s | "
+                    f"time offset {live_step['tau_ps']:+.3f} ps | "
+                    f"clock {live_step['clock_status']}"
+                )
             if update.get('integrity_failure'):
                 app.qcs_quality_var.set('Acquisition integrity failure: ' + update['integrity_failure'])
-            counts = update['retained']
-            app.qcs_counts_var.set(
-                f"Current interval: TTX {counts['ttx']:,} | HH {counts['hh']:,} events; "
-                f"completed: {update['completed_intervals']}; "
-                f"capacity drops: {sum(update['evicted'].values()):,}. "
-                f"TTX total {update['total']['ttx']:,} in {update['elapsed_s']:.2f} s "
-                f"({update['total']['ttx'] / max(update['elapsed_s'], 1e-9):,.0f} events/s); "
-                f"per channel {update['ttx_channel_totals']}")
         if controller.alignment_result is not None and not controller.alignment_plot_shown:
             controller.alignment_plot_shown = True
             try:
@@ -775,11 +818,9 @@ def _poll_qcs(app):
         elif remote is not None and remote['result'] is not None and remote['result']['status'] != 'complete':
             reason = remote['result'].get('error', remote['status'])
             app.qcs_status_var.set("QCS remote error: " + reason)
-            app.qcs_quality_var.set("Session integrity failed: " + reason + "; previous intervals are unverified")
+            app.qcs_quality_var.set("Session integrity failed: " + reason)
         elif remote is not None and remote['result'] is not None and controller.quality is not None and not controller.integrity_failure:
-            app.qcs_quality_var.set(f"Interval {controller.quality['sequence']}: {controller.quality['status']}; "
-                                   + '; '.join(controller.quality['reasons'])
-                                   + ". Network session SHA-256 verified; remote device loss is not certified.")
+            app.qcs_status_var.set("Remote acquisition session complete")
     app.qcs_sweep_range_entry.configure(state="disabled" if busy else "normal")
     app.qcs_sweep_num_entry.configure(state="disabled" if busy else "normal")
     app.qcs_fine_steps_entry.configure(state="disabled" if busy else "normal")
@@ -792,9 +833,6 @@ def _poll_qcs(app):
     app.qcs_stop_button.configure(state="normal" if busy else "disabled")
     app.qutag_timestamp_start_writing_button.configure(
         state="disabled" if busy or not app.qutag_timestamp_time_tagger_available else "normal")
-    window.after(100, lambda: _poll_qcs(app))
-
-
 def _timestamp_internet_enabled(app):
     var = getattr(app, "qutag_timestamp_internet_var", None)
     return bool(var is not None and var.get())
@@ -2194,7 +2232,15 @@ def _get_lock_calibration(app, channel):
     counter_indices = list(getattr(app, "qutag_piezoscan_counter_indices", []))
 
     if not voltages or not values:
-        raise RuntimeError("No QuTAG piezo calibration found. Run Scan Piezo (SPD) first.")
+        from qutag_piezoscan_helper import load_latest_qutag_piezoscan_csv
+        load_latest_qutag_piezoscan_csv(app, force=True)
+        voltages = list(getattr(app, "qutag_piezoscan_voltages", []))
+        values = list(getattr(app, "qutag_piezoscan_values", []))
+        counter_indices = list(getattr(app, "qutag_piezoscan_counter_indices", []))
+    if not voltages or not values:
+        raise RuntimeError(
+            "No saved QuTAG piezo calibration was found. Run Scan Piezo (SPD) first."
+        )
     if channel not in counter_indices:
         raise RuntimeError(
             f"Channel {channel} is not in the last calibration. "

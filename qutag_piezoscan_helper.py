@@ -1,6 +1,8 @@
 import csv
+import math
 import os
 import queue
+import re
 import threading
 import time
 
@@ -19,6 +21,79 @@ from tkinter import (
 
 # Temporary scan selection; other HydraHarp acquisition paths are unchanged.
 ENABLE_HYDRAHARP_PIEZOSCAN = False
+
+
+def load_latest_qutag_piezoscan_csv(app, *, force=False):
+    """Load the latest saved Time Tagger X scan into the app calibration state."""
+    if (not force and getattr(app, "qutag_piezoscan_voltages", None)
+            and getattr(app, "qutag_piezoscan_values", None)):
+        return None
+
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "automatic_piezoscan_logs")
+    try:
+        candidates = [
+            os.path.join(log_dir, name)
+            for name in os.listdir(log_dir)
+            if name.startswith("qutag_piezo_scan_") and name.lower().endswith(".csv")
+        ]
+    except OSError:
+        return None
+    candidates.sort(key=os.path.getmtime, reverse=True)
+
+    for filepath in candidates:
+        try:
+            with open(filepath, newline="", encoding="utf-8-sig") as file:
+                reader = csv.DictReader(file)
+                if not reader.fieldnames:
+                    continue
+                voltage_column = next(
+                    (name for name in reader.fieldnames
+                     if re.sub(r"[^a-z0-9]", "", name.lower()) == "piezovoltagev"),
+                    None,
+                )
+                channel_columns = []
+                for name in reader.fieldnames:
+                    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+                    match = re.fullmatch(r"(?:timetaggerx|timetagger|ttx|qutag)(\d+)", normalized)
+                    if match:
+                        channel_columns.append((int(match.group(1)), name))
+                if voltage_column is None or not channel_columns:
+                    continue
+                channel_columns.sort()
+                voltages, values = [], []
+                for row in reader:
+                    try:
+                        voltage = float(row[voltage_column])
+                        counts = [float(row[column]) for _channel, column in channel_columns]
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if math.isfinite(voltage) and all(math.isfinite(count) for count in counts):
+                        voltages.append(voltage)
+                        values.append(counts)
+                if len(voltages) < 2:
+                    continue
+
+                app.qutag_piezoscan_voltages = voltages
+                app.qutag_piezoscan_values = values
+                app.qutag_piezoscan_counter_indices = [channel for channel, _ in channel_columns]
+                app.qutag_piezoscan_hydraharp_channel_indices = []
+                app.qutag_piezoscan_series = [
+                    ("Time Tagger X", channel) for channel, _ in channel_columns
+                ]
+                app.qutag_piezoscan_peak_voltages = {}
+                app.qutag_piezoscan_peak_counts = {}
+                for column, channel in enumerate(app.qutag_piezoscan_counter_indices):
+                    peak_index = max(range(len(values)), key=lambda index: values[index][column])
+                    app.qutag_piezoscan_peak_voltages[channel] = voltages[peak_index]
+                    app.qutag_piezoscan_peak_counts[channel] = values[peak_index][column]
+                if hasattr(app, "tx_log_print"):
+                    app.tx_log_print(
+                        f"[QUTAG SCAN] Loaded {len(voltages)} calibration points from {filepath}"
+                    )
+                return filepath
+        except (OSError, csv.Error, UnicodeError, ValueError):
+            continue
+    return None
 
 
 def _ensure_qutag_piezoscan_state(app):

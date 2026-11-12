@@ -7,12 +7,12 @@
   "PPS_RTR": {
     "chip_id": 1,
     "pin": 8,
-    "voltage": 11.3
+    "voltage": 11.7
   },
   "PPS_CPL": {
     "chip_id": 1,
     "pin": 9,
-    "voltage": 10.15
+    "voltage": 10.6
   },
   "UMZI": {
     "chip_id": 1,

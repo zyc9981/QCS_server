@@ -1,10 +1,4 @@
-"""Live acquisition into bounded memory for the Time Stamps QCS controls.
-
-Analysis will reuse qcs_analyzer. No fitting or frequency command is run here.
-The existing remote service may still spool its own files; this receiver never
-creates timestamp files. Starting both streams is coordinated, not a hardware
-synchronization of their clocks.
-"""
+"""Live in-memory QCS acquisition, alignment, and interval clock tracking."""
 from __future__ import annotations
 
 from collections import deque
@@ -13,6 +7,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from numba import njit
+from qcs_analyzer._implementation import *
 
 import numpy as np
 
@@ -21,7 +17,7 @@ DEFAULT_QCS_CONFIG = {
     'init_interval_s': 2.0,
     'acquisition_interval_s': 1.0,
 
-    'latency_ms': 250.0,
+    'latency_ms': 350.0,
     'init_time_offset_range_ms': 40.0,
     'init_bin_number': 1_000_000,
 
@@ -30,8 +26,10 @@ DEFAULT_QCS_CONFIG = {
 
     'fine_steps': 20,
     'fine_sweep_range_ps_per_s': 100.0,
-    
+
 }
+
+MAX_TAU_HISTORY = 86_400
 
 
 def check_timestamp_quality(t_ps, ch, *, allowed_channels, required_channels,
@@ -58,6 +56,114 @@ def check_timestamp_quality(t_ps, ch, *, allowed_channels, required_channels,
     return dict(errors=errors, insufficient=insufficient, counts=counts)
 
 
+def g2_histogram_numba(
+    acquisition_a,
+    acquisition_b,
+    edges,
+    *,
+    Ta_s,
+    chA,
+    chB,
+    time_bin_ps_init,
+):
+    """
+    Build a coincidence histogram and return a fit_g2-compatible dictionary.
+
+    Requirements:
+        - Acquisitions are sorted, finite, 1-D NumPy timestamp arrays.
+        - Timestamps and edges use picoseconds.
+        - Edges are uniformly spaced.
+        - Bins include their lower edge and exclude their upper edge.
+    """
+    acquisition_a = np.asarray(acquisition_a)
+    acquisition_b = np.asarray(acquisition_b)
+    edges = np.asarray(edges, dtype=np.float64)
+
+    if acquisition_a.ndim != 1 or acquisition_b.ndim != 1:
+        raise ValueError("Acquisitions must be one-dimensional.")
+
+    if edges.ndim != 1 or len(edges) < 2:
+        raise ValueError("edges must contain at least two boundaries.")
+
+    widths = np.diff(edges)
+    time_bin_ps = widths[0]
+
+    if (
+        not np.all(np.isfinite(edges))
+        or np.any(widths <= 0)
+        or not np.allclose(widths, time_bin_ps, rtol=1e-8, atol=0)
+    ):
+        raise ValueError("edges must be finite, increasing, and uniform.")
+
+    if not np.isfinite(time_bin_ps_init) or time_bin_ps_init <= 0:
+        raise ValueError("time_bin_ps_init must be finite and positive.")
+    if not np.isfinite(Ta_s) or Ta_s <= 0:
+        raise ValueError("Ta_s must be finite and positive.")
+
+    # Create the compiled helper once, then reuse it on subsequent calls.
+    if not hasattr(g2_histogram_numba, "_count_pairs"):
+
+        @njit(fastmath=False)
+        def count_pairs(t_a, t_b, bin_edges):
+            n_bins = len(bin_edges) - 1
+            bin_width = bin_edges[1] - bin_edges[0]
+            lower = bin_edges[0]
+            upper = bin_edges[-1]
+
+            counts = np.zeros(n_bins, dtype=np.int64)
+            n_b = len(t_b)
+            j_start = 0
+
+            for i in range(len(t_a)):
+                timestamp_a = t_a[i]
+
+                while j_start < n_b:
+                    if t_b[j_start] - timestamp_a >= lower:
+                        break
+                    j_start += 1
+
+                if j_start == n_b:
+                    break
+
+                j = j_start
+                while j < n_b:
+                    delay = t_b[j] - timestamp_a
+
+                    if delay >= upper:
+                        break
+
+                    k = int(np.floor((delay - lower) / bin_width))
+
+                    # Resolve floating-point rounding at bin boundaries.
+                    k = min(max(k, 0), n_bins - 1)
+
+                    while k > 0 and delay < bin_edges[k]:
+                        k -= 1
+                    while k < n_bins - 1 and delay >= bin_edges[k + 1]:
+                        k += 1
+
+                    counts[k] += 1
+                    j += 1
+
+            return counts
+
+        g2_histogram_numba._count_pairs = count_pairs
+
+    counts = g2_histogram_numba._count_pairs(
+        acquisition_a, acquisition_b, edges
+    )
+    centers = edges[:-1] + widths / 2.0
+
+    return {
+        "centers": centers.copy(),
+        "histogram": counts / time_bin_ps * time_bin_ps_init,
+        "histogram_raw": counts.copy(),
+        "T_acq_s": float(Ta_s),
+        "chA": chA,
+        "chB": chB,
+    }
+
+
 class RealtimeG2Controller:
     """Own a local TimeTagStream and remote in-memory recording session."""
 
@@ -71,6 +177,9 @@ class RealtimeG2Controller:
         self.latency_ms = float(self.config.get('latency_ms', DEFAULT_QCS_CONFIG['latency_ms']))
         if not np.isfinite(self.latency_ms) or self.latency_ms < 0:
             raise ValueError('latency_ms must be a nonnegative finite number')
+        self.live_clock_adjustment_enabled = (
+            self.config.get('live_clock_adjustment_enabled', False) is True
+        )
         alignment_options = dict(self.config.get('global_alignment_kwargs', {}))
         alignment_options.setdefault(
             'sweep_range_ps_per_s', DEFAULT_QCS_CONFIG['sweep_range_ps_per_s'])
@@ -105,6 +214,22 @@ class RealtimeG2Controller:
         self.alignment_plot_shown = False
         self.timestamp_origins = None
         self.initialization_worker = None
+        self.clock_command_id = None
+        self.initial_clock_adjustment_applied = False
+        self.live_discard_through_sequence = None
+        self.live_interval_queue = queue.Queue(maxsize=2)
+        self.live_analysis_worker = None
+        self.live_state = None
+        self.live_t10_ps = None
+        self.live_t20_ps = None
+        self.calibrated_offset_ps = None
+        self.current_clock_setpoint_ps_per_s = None
+        self.live_step_result = None
+        self.live_analysis_steps = 0
+        self.tau_time_s_history = np.full(MAX_TAU_HISTORY, np.nan, dtype=np.float64)
+        self.tau_ps_history = np.full(MAX_TAU_HISTORY, np.nan, dtype=np.float64)
+        self.tau_history_count = 0
+        self.tau_history_version = 0
         legacy_limit = self.config.get('max_events_per_source')
         self.max_events = {
             'ttx': int(self.config.get('max_events_ttx', legacy_limit or 10_000_000)),
@@ -182,6 +307,9 @@ class RealtimeG2Controller:
             self.status = 'Requesting remote acquisition into local memory...'
             self.remote.record_memory(self._receive_hh, self._remote_ready,
                                       duration=float(self.config.get('duration_s', 3600)))
+            self.live_analysis_worker = threading.Thread(
+                target=self._live_analysis_worker, name='qcs-live-analysis', daemon=True)
+            self.live_analysis_worker.start()
             self.worker = threading.Thread(target=self._run_worker, name='qcs-acquisition', daemon=True)
             self.worker.start()
         except Exception:
@@ -320,11 +448,306 @@ class RealtimeG2Controller:
                     self.initialization_worker.start()
                 else:
                     self.initialization_status = 'Initialization failed: ' + status + '; ' + '; '.join(report['reasons'])
+            elif status == 'checks passed' and not self.integrity_failure and not self.stop_event.is_set():
+                # Skip intervals until the initial clock write is acknowledged,
+                # including the interval that overlaps the write itself.
+                with self.lock:
+                    live_ready = self.initial_clock_adjustment_applied
+                    discard_through = self.live_discard_through_sequence
+                if live_ready and completed['sequence'] > discard_through:
+                    try:
+                        self.live_interval_queue.put_nowait((completed['sequence'], arrays))
+                    except queue.Full:
+                        self._record_integrity_failure(
+                            'Live analysis fell behind; a completed interval could not be queued')
         finally:
             completed['buffers'].clear()
 
+    def _send_clock_adjustment(self, correction_ps_per_s):
+        """Send a correction through the shared remote command path."""
+        command_id = self.remote.set_clock_correction(correction_ps_per_s)
+        with self.lock:
+            self.clock_command_id = command_id
+        return command_id
+
+    def _wait_for_clock_adjustment(self, command_id):
+        """Wait for the matching remote CLOCK_RESULT terminal status."""
+        terminal = {'applied', 'failed', 'timed_out', 'connection_lost'}
+        while True:
+            result = self.remote.get_clock_command(command_id)
+            if result is None:
+                return {'status': 'missing', 'message': 'Remote command result was not found'}
+            if result.get('status') in terminal:
+                return result
+            if self.stop_event.wait(0.05):
+                return {'status': 'stopped', 'message': 'QCS stopped while waiting for clock adjustment'}
+
+    def _analyze_live_interval(
+            self,
+            sequence,
+            t1_ps,
+            ch1,
+            t2_ps,
+            ch2,
+            state,
+            ch_0=1,
+            ch_1=6,
+            ch_2=2,
+            ch_ref_0=3,
+            ch_ref_1=7,
+
+            t10_ps=0,
+            t20_ps=0,
+            fit_curve="g2calib_2",
+            fit_parameters={
+                "height": 40,
+                "sigma": 100,
+                "offset": 1,
+            },
+            # sour_freq=100e6,
+            fwhm_calib_ps=1000,
+            second_order_fit=False,
+            show_fit=False,
+            Freq=50e6,
+
+            T_calib = 0.0,
+            T_calib_rt = 0.0,
+            ):
+        """Analyze one interval, update and return persistent tracking state."""
+        if not isinstance(state, dict):
+            raise TypeError("state must be a mutable dictionary")
+
+        # ------------------------------------------------------------
+        # STEP 1:
+        # Prepare for fitting and measurement.
+        # ------------------------------------------------------------
+        fit_curve = FIT_CURVE_ALIASES.get(str(fit_curve).strip().lower(), str(fit_curve).strip().lower())
+        if fit_curve not in FIT_CURVES:
+            available = ", ".join(sorted(FIT_CURVES))
+            raise ValueError(f"Unknown fit_curve '{fit_curve}'. Choose one of: {available}.")
+        try:
+            fit_parameter_guess = {} if fit_parameters is None else dict(fit_parameters)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("fit_parameters must be a dictionary of initial fit values.") from exc
+
+        # Keep each channel chronological.
+        t_0 = t1_ps[ch1 == ch_0] - t10_ps
+        # t_ref_0 = t1_ps[ch1 == ch_ref_0]
+        t_1 = t2_ps[ch2 == ch_1] - t20_ps
+        # t_ref_1 = t2_ps[ch2 == ch_ref_1]
+        t_2 = t1_ps[ch1 == ch_2] - t10_ps
+
+        # ------------------------------------------------------------
+        # STEP 2:
+        # g2 processing.
+        # ------------------------------------------------------------
+        t_lo = state["tau_ps"] - state["tau_span_ps"] * 0.5
+        t_hi = state["tau_ps"] + state["tau_span_ps"] * 0.5
+        time_bin_ps = state["time_bin_ps"]
+        edges = np.arange(t_lo, t_hi + time_bin_ps, time_bin_ps)
+        centers = edges[:-1] + time_bin_ps / 2
+        start_stop_results = np.zeros(len(centers), dtype=np.int64)
+
+        results = g2_histogram_numba(
+            t_0,
+            t_1,
+            edges,
+            Ta_s=self.acquisition_interval_s,
+            chA=ch_0,
+            chB=ch_1,
+            time_bin_ps_init=state["time_bin_ps"],
+        )
+
+        t_lo_rt = state["tau_rt_ps"] - state["tau_span_ps"] * 0.5
+        t_hi_rt = state["tau_rt_ps"] + state["tau_span_ps"] * 0.5
+        time_bin_rt_ps = state["time_bin_rt_ps"]
+        edges_rt = np.arange(t_lo_rt, t_hi_rt + time_bin_rt_ps, time_bin_rt_ps)
+        centers_rt = edges_rt[:-1] + time_bin_rt_ps / 2
+        start_stop_results_rt = np.zeros(len(centers_rt), dtype=np.int64)
+
+        results_rt = g2_histogram_numba(
+            t_0,
+            t_2,
+            edges_rt,
+            Ta_s=self.acquisition_interval_s,
+            chA=ch_0,
+            chB=ch_2,
+            time_bin_ps_init=state["time_bin_rt_ps"],
+        )
+
+        # save_g2_results(results_rt, output_filename="./test.npz")
+
+        # ------------------------------------------------------------
+        # STEP 3:
+        # Estimate time offset and frequency skew from g2 fit.
+        # ------------------------------------------------------------
+
+        try:
+            fit_parameters = fit_parameter_guess.copy()
+            fit_parameters["center"] = float(
+                results["centers"][np.argmax(results["histogram"])]
+            )
+            fit = fit_g2(
+                results,
+                curve=fit_curve,
+                parameters=fit_parameters,
+                fit_window=np.rint(float(1e12)/Freq) * 1.2,
+                show=show_fit,
+            )
+        except Exception as exc:
+            raise
+
+            print(f"Time-dependent g2 fit failed.")
+            fit = None
+            exc_value = exc
+        else:
+            exc_value = None
+
+        try:
+            fit_parameters = fit_parameter_guess.copy()
+            fit_parameters["center"] = float(
+                results_rt["centers"][np.argmax(results_rt["histogram"])]
+            )
+            # print(fit_parameters["center"])
+            fit_rt = fit_g2(
+                results_rt,
+                curve=fit_curve,
+                parameters=fit_parameters,
+                fit_window=np.rint(float(1e12)/Freq) * 1.2,
+                show=show_fit,
+                # show=True,
+            )
+        except Exception as exc:
+            raise
+
+            print(f"Time-dependent g2 fit failed.")
+            fit = None
+            exc_value = exc
+        else:
+            exc_value = None
+
+        if not fit.get("success", True):
+            raise RuntimeError(
+                f"g2 fit failed for channels {ch_0}/{ch_1}: {fit.get('message') or 'optimizer did not converge'}"
+            )
+        if not fit_rt.get("success", True):
+            raise RuntimeError(
+                f"g2 fit failed for channels {ch_0}/{ch_2}: {fit_rt.get('message') or 'optimizer did not converge'}"
+            )
+
+        T_mid_ps = (t_0[0] + t_0[-1]) / 2
+        elapsed_mid_ps = T_mid_ps - state["T_lastmid_ps"]
+        if elapsed_mid_ps <= 0:
+            raise ValueError("Live interval midpoint did not advance")
+        state["u0"] = (fit["center"] - state["tau_ps"]) / elapsed_mid_ps
+        state["tau_ps"] = fit["center"]
+        print(state["tau_ps"])
+        state["tau_rt_ps"] = fit_rt["center"]
+        state["epsilon_ps"] = state["tau_ps"] - state["tau_rt_ps"] / 2
+        state["T_lastmid_ps"] = T_mid_ps
+
+        return state
+
+    def _append_tau_history(self, elapsed_s, tau_ps):
+        """Store up to one day of live offset estimates without rolling."""
+        with self.lock:
+            if self.tau_history_count >= MAX_TAU_HISTORY:
+                return
+            index = self.tau_history_count
+            self.tau_time_s_history[index] = float(elapsed_s)
+            self.tau_ps_history[index] = float(tau_ps)
+            self.tau_history_count += 1
+            self.tau_history_version += 1
+
+    def tau_history_snapshot(self, known_version=-1):
+        """Return a stable copy of new history data for the GUI thread."""
+        with self.lock:
+            version = self.tau_history_version
+            if version == known_version:
+                return version, None, None
+            count = self.tau_history_count
+            if count == 0:
+                return version, None, None
+            return (version, self.tau_time_s_history[:count].copy(),
+                    self.tau_ps_history[:count].copy())
+
+    def _live_analysis_worker(self):
+        """Process completed intervals sequentially outside acquisition callbacks."""
+        while not self.stop_event.is_set():
+            try:
+                item = self.live_interval_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if item is None:
+                    return
+                sequence, arrays = item
+                (t1_ps, ch1), (t2_ps, ch2) = arrays['ttx'], arrays['hh']
+                if self.live_state is None or self.live_t10_ps is None or self.live_t20_ps is None:
+                    raise RuntimeError('Live tracking state was not initialized after alignment')
+                state = self._analyze_live_interval(
+                    sequence, t1_ps, ch1, t2_ps, ch2,
+                    state=self.live_state,
+                    t10_ps=self.live_t10_ps,
+                    t20_ps=self.live_t20_ps,
+                )
+                self.live_state = state
+                self._append_tau_history(state['T_lastmid_ps'] * 1e-12, state['tau_ps'])
+                self.live_analysis_steps += 1
+                first_live_step = self.live_analysis_steps == 1
+                residual_drift_ps_per_s = float(state['u0']) * 1e12
+                with self.lock:
+                    self.live_step_result = {
+                        'sequence': int(sequence),
+                        'tau_ps': float(state['tau_ps']),
+                        'u0_ps_per_s': residual_drift_ps_per_s,
+                        'clock_status': (
+                            'unchanged (first live fit)' if first_live_step else 'pending'
+                        ),
+                    }
+                self._publish()
+                if first_live_step:
+                    # Use the first live fit as a measurement only. Start
+                    # applying interval corrections from the next fit onward.
+                    continue
+                if not self.live_clock_adjustment_enabled:
+                    with self.lock:
+                        self.live_step_result['clock_status'] = 'disabled'
+                    self._publish()
+                    continue
+
+                # The remote node accepts an absolute correction relative to
+                # nominal. u0 is measured drift, so cancel it against the
+                # currently applied setpoint.
+                target_ps_per_s = (
+                    float(self.current_clock_setpoint_ps_per_s) - residual_drift_ps_per_s
+                )
+                command_id = self._send_clock_adjustment(target_ps_per_s)
+                command_result = self._wait_for_clock_adjustment(command_id)
+                if command_result.get('status') != 'applied':
+                    raise RuntimeError(
+                        f"Clock command {command_id}: {command_result.get('status')}: "
+                        f"{command_result.get('message', '')}")
+                applied = command_result.get('applied_correction_ps_per_s')
+                self.current_clock_setpoint_ps_per_s = (
+                    float(applied) if applied is not None else target_ps_per_s
+                )
+                with self.lock:
+                    self.live_step_result['clock_status'] = 'adjustment applied'
+                    self.live_step_result['clock_setpoint_ps_per_s'] = (
+                        self.current_clock_setpoint_ps_per_s
+                    )
+                self._publish()
+            except Exception as exc:
+                message = f'Live analysis/adjustment failed: {exc}'
+                print(f'QCS live tracking error (interval {sequence}): {message}', flush=True)
+                self._record_integrity_failure(message)
+                self._publish()
+            finally:
+                self.live_interval_queue.task_done()
+
     def _initialize_alignment(self, arrays):
-        """Apply the start-time offset, then sweep the rebased photon streams."""
+        """Find global alignment, command the correction, and await its result."""
         try:
             from qcs_analyzer.global_freq_analysis import global_freq_alignment_g2
             t1_ps, ch1 = arrays['ttx']
@@ -363,6 +786,43 @@ class RealtimeG2Controller:
             options['show_plot'] = False
             # Initial global-frequency sweep is called here, once per QCS session.
             result = global_freq_alignment_g2(first, second, **options)
+            unique = result.get('unique_best_candidate', False)
+            command_summary = 'not sent'
+            adjustment_applied = False
+            if not unique:
+                clock_status = 'skipped: alignment did not identify a unique skew'
+            elif not self.remote.snapshot().get('clock_adjustment_supported', False):
+                clock_status = 'skipped: remote node has not advertised clock-adjustment support'
+            else:
+                try:
+                    command_id = self._send_clock_adjustment(result['skew_ps_per_s'])
+                    result['clock_command_id'] = command_id
+                    command_summary = f'sent #{command_id}'
+                    with self.lock:
+                        self.initialization_status = (
+                            f"Offset: {(latency_ps + result['residual_offset_ps']) * 1e-9:.6g} ms | "
+                            f"correction: {result['skew_ps_per_s']:+.2f} ps/s | "
+                            f"command: {command_summary}")
+                    self._publish()
+                    command_result = self._wait_for_clock_adjustment(command_id)
+                    command_state = command_result.get('status', 'unknown')
+                    if command_state == 'applied':
+                        adjustment_applied = True
+                        command_summary = f'applied #{command_id}'
+                        clock_status = f'applied command {command_id}'
+                        applied = command_result.get('applied_correction_ps_per_s')
+                        self.current_clock_setpoint_ps_per_s = (
+                            float(applied) if applied is not None
+                            else float(result['skew_ps_per_s'])
+                        )
+                    else:
+                        command_summary = f'{command_state} #{command_id}'
+                        clock_status = (
+                            f"{command_state}: "
+                            f"{command_result.get('message', 'remote adjustment did not complete')}")
+                except Exception as exc:
+                    clock_status = f'not sent: {exc}'
+            result['clock_command_status'] = clock_status
             # Keep estimates/diagnostic curves, release the full aligned tag array.
             result.pop('t2_aligned_ps', None)
             result['start_time_offset_ps'] = offset_ps
@@ -377,17 +837,42 @@ class RealtimeG2Controller:
                 f"QCS final alignment: skew={result['skew_ps_per_s']:+.3f} ps/s, "
                 f"final offset={result['final_offset_ms']:.9g} ms "
                 f"(latency {self.latency_ms:g} ms + residual "
-                f"{result['residual_offset_ps'] * 1e-6:.6g} us)",
+                f"{result['residual_offset_ps'] * 1e-6:.6g} us); "
+                f"clock command: {clock_status}",
                 flush=True,
             )
             with self.lock:
                 self.timestamp_origins = origins
                 self.alignment_result = result
-                unique = result.get('unique_best_candidate', False)
+                if adjustment_applied:
+                    # The global routine reports the additive residual needed
+                    # on the HH-relative timestamps. Express that calibrated
+                    # offset as the initial Unix/latency offset minus the
+                    # measured residual delay (which is -residual_offset_ps).
+                    calibrated_offset_ps = int(offset_ps) + int(round(
+                        result['residual_offset_ps']))
+                    self.calibrated_offset_ps = calibrated_offset_ps
+                    self.live_t10_ps = int(origins[0])
+                    self.live_t20_ps = int(origins[1]) - calibrated_offset_ps
+                    self.live_state = {
+                        'time_bin_ps': 20.0,
+                        'time_bin_rt_ps': 20.0,
+                        'tau_span_ps': 1_000_000.0,
+                        'tau_ps': 0.0,
+                        'tau_rt_ps': 58_968_630.0,
+                        'epsilon_ps': 0.0,
+                        'u0': 0.0,
+                        'T_lastmid_ps': 0.0,
+                    }
+                    self.initial_clock_adjustment_applied = True
+                    # The active interval can contain events captured before
+                    # the remote write completed. Skip it and start on the
+                    # following full interval.
+                    self.live_discard_through_sequence = self.completed_intervals + 1
                 self.initialization_status = (
-                    f"Global sweep complete: correction {result['skew_ps_per_s']:.2f} ps/s, "
-                    f"final offset {result['final_offset_ms']:.9f} ms" +
-                    ('' if unique else ' (tied candidates; skew unresolved)'))
+                    f"Offset: {result['final_offset_ms']:.6g} ms | "
+                    f"correction: {result['skew_ps_per_s']:+.2f} ps/s | "
+                    f"command: {command_summary}")
         except Exception as exc:
             with self.lock:
                 self.initialization_status = 'Initialization failed: ' + str(exc)
@@ -489,12 +974,19 @@ class RealtimeG2Controller:
         with self.lock:
             elapsed = (max(0.0, time.monotonic() - self.session_started_monotonic)
                        if self.session_started_monotonic is not None else 0.0)
+            clock_command_id = self.clock_command_id
             update = dict(status=self.status, error=self.error, running=self.running,
                           retained=dict(self.counts), total=dict(self.total), evicted=dict(self.evicted),
                           completed_intervals=self.completed_intervals, discarded=dict(self.discarded),
                           quality=self.quality, integrity_failure=self.integrity_failure,
                           initialization_status=self.initialization_status,
+                          live_step_result=(dict(self.live_step_result)
+                                            if self.live_step_result is not None else None),
                           elapsed_s=elapsed, ttx_channel_totals=dict(self.ttx_channel_totals))
+        update['clock_command'] = (
+            self.remote.get_clock_command(clock_command_id)
+            if self.remote is not None and clock_command_id is not None else None
+        )
         try:
             self.updates.get_nowait()
         except queue.Empty:

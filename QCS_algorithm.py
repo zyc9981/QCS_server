@@ -560,12 +560,12 @@ class RealtimeG2Controller:
         t_1 = t2_ps[ch2 == ch_1] - t20_ps
         # t_ref_1 = t2_ps[ch2 == ch_ref_1]
         t_2 = t1_ps[ch1 == ch_2] - t10_ps
-        # print("TTX: ", t_0[0], "HH: ", t_1[0])
 
         # ------------------------------------------------------------
         # STEP 2:
         # g2 processing.
         # ------------------------------------------------------------
+        t0 = time.time()
         t_lo = state["tau_ps"] - state["tau_span_ps"] * 0.5
         t_hi = state["tau_ps"] + state["tau_span_ps"] * 0.5
         time_bin_ps = state["time_bin_ps"]
@@ -600,13 +600,14 @@ class RealtimeG2Controller:
             time_bin_ps_init=state["time_bin_rt_ps"],
         )
 
-        # save_g2_results(results_rt, output_filename="./test.npz")
+        print("g2 processing: ", time.time() - t0)
 
         # ------------------------------------------------------------
         # STEP 3:
         # Estimate time offset and frequency skew from g2 fit.
         # ------------------------------------------------------------
 
+        t0 = time.time()
         try:
             fit_parameters = fit_parameter_guess.copy()
             fit_parameters["center"] = float(
@@ -660,6 +661,7 @@ class RealtimeG2Controller:
                 f"g2 fit failed for channels {ch_0}/{ch_2}: {fit_rt.get('message') or 'optimizer did not converge'}"
             )
 
+        print("g2 fit ", time.time() - t0)
         T_mid_ps = (t_0[0] + t_0[-1]) / 2
         elapsed_mid_ps = T_mid_ps - state["T_lastmid_ps"]
         if elapsed_mid_ps <= 0:

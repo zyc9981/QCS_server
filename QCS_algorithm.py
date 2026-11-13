@@ -19,7 +19,7 @@ DEFAULT_QCS_CONFIG = {
     'init_interval_s': 2.0,
     'acquisition_interval_s': 1.0,
 
-    'latency_ms': 400.0,
+    'latency_ms': 500.0,
     'init_time_offset_range_ms': 40.0,
     'init_bin_number': 1_000_000,
 

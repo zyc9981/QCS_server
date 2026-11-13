@@ -19,7 +19,7 @@ DEFAULT_QCS_CONFIG = {
     'init_interval_s': 2.0,
     'acquisition_interval_s': 1.0,
 
-    'latency_ms': 500.0,
+    'latency_ms': 550.0,
     'init_time_offset_range_ms': 40.0,
     'init_bin_number': 1_000_000,
 
@@ -31,6 +31,17 @@ DEFAULT_QCS_CONFIG = {
 
     # Temporary diagnostic gain; restore 1.0 for full live correction.
     'live_correction_gain': 0.1,
+}
+
+DEFAULT_LIVE_STATE = {
+    'time_bin_ps': 20.0,
+    'time_bin_rt_ps': 20.0,
+    'tau_span_ps': 500_000.0,
+    'tau_ps': 0.0,
+    'tau_rt_ps': 58_968_630.0,
+    'epsilon_ps': 0.0,
+    'u0': 0.0,
+    'T_lastmid_ps': 0.0,
 }
 
 MAX_TAU_HISTORY = 86_400
@@ -617,7 +628,7 @@ class RealtimeG2Controller:
                 results,
                 curve=fit_curve,
                 parameters=fit_parameters,
-                fit_window=np.rint(float(1e12)/Freq) * 1.2,
+                fit_window=np.rint(float(1e12)/Freq) * 1.0,
                 show=show_fit,
             )
         except Exception as exc:
@@ -628,7 +639,9 @@ class RealtimeG2Controller:
             exc_value = exc
         else:
             exc_value = None
+        print("g2 fit1 ", time.time() - t0)
 
+        t0 = time.time()
         try:
             fit_parameters = fit_parameter_guess.copy()
             fit_parameters["center"] = float(
@@ -639,7 +652,7 @@ class RealtimeG2Controller:
                 results_rt,
                 curve=fit_curve,
                 parameters=fit_parameters,
-                fit_window=np.rint(float(1e12)/Freq) * 1.2,
+                fit_window=np.rint(float(1e12)/Freq) * 1.0,
                 show=show_fit,
                 # show=True,
             )
@@ -661,7 +674,7 @@ class RealtimeG2Controller:
                 f"g2 fit failed for channels {ch_0}/{ch_2}: {fit_rt.get('message') or 'optimizer did not converge'}"
             )
 
-        print("g2 fit ", time.time() - t0)
+        print("g2 fit2 ", time.time() - t0)
         T_mid_ps = (t_0[0] + t_0[-1]) / 2
         elapsed_mid_ps = T_mid_ps - state["T_lastmid_ps"]
         if elapsed_mid_ps <= 0:
@@ -967,16 +980,7 @@ class RealtimeG2Controller:
                     self.calibrated_offset_ps = calibrated_offset_ps
                     self.live_t10_ps = int(origins[0])
                     self.live_t20_ps = int(origins[1]) - calibrated_offset_ps
-                    self.live_state = {
-                        'time_bin_ps': 20.0,
-                        'time_bin_rt_ps': 20.0,
-                        'tau_span_ps': 500_000.0,
-                        'tau_ps': 0.0,
-                        'tau_rt_ps': 58_968_630.0,
-                        'epsilon_ps': 0.0,
-                        'u0': 0.0,
-                        'T_lastmid_ps': 0.0,
-                    }
+                    self.live_state = dict(DEFAULT_LIVE_STATE)
                     self.initial_clock_adjustment_applied = True
                     # The active interval can contain events captured before
                     # the remote write completed. Skip it and start on the

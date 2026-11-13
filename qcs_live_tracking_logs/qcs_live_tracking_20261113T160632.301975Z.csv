@@ -1,0 +1,8 @@
+event,interval,relative_s,tau_ps,u0_ps_per_s,T_lastmid_ms,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,3,0.000000000,,,,,,,,checks passed,
+acquisition_finished,4,1.991055551,,,,,,,,checks passed,
+acquisition_finished,5,3.992094328,,,,,,,,checks passed,
+acquisition_finished,6,5.991650839,,,,,,,,checks passed,
+acquisition_finished,7,7.989534472,,,,,,,,checks passed,
+analysis_finished,3,21.422899989,-1921.395428143505,-383.7140821836048,5007.362297493501,,,,,,
+clock_adjustment_skipped,3,21.423574463,-1921.395428143505,-383.7140821836048,5007.362297493501,,,first live fit is measurement-only,,,

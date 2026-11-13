@@ -514,7 +514,12 @@ class RealtimeG2Controller:
                 return {'status': 'missing', 'message': 'Remote command result was not found'}
             if result.get('status') in terminal:
                 return result
-            if self.stop_event.wait(0.05):
+            waiter = getattr(self.remote, 'wait_for_clock_command', None)
+            if waiter is not None:
+                waiter(command_id, timeout=0.05)
+            elif self.stop_event.wait(0.05):
+                return {'status': 'stopped', 'message': 'QCS stopped while waiting for clock adjustment'}
+            if self.stop_event.is_set():
                 return {'status': 'stopped', 'message': 'QCS stopped while waiting for clock adjustment'}
 
     def _analyze_live_interval(
@@ -565,12 +570,19 @@ class RealtimeG2Controller:
         except (TypeError, ValueError) as exc:
             raise TypeError("fit_parameters must be a dictionary of initial fit values.") from exc
 
-        # Keep each channel chronological.
-        t_0 = t1_ps[ch1 == ch_0] - t10_ps
-        # t_ref_0 = t1_ps[ch1 == ch_ref_0]
+        t0 = time.time()
+        # t_0 = t1_ps[ch1 == ch_0] - t10_ps
+        t_0 = t1_ps[ch1 == ch_0]
+        t_0 -= np.int64(t10_ps)
+        print("g2 prepare1: ", time.time() - t0)
+        t0 = time.time()
         t_1 = t2_ps[ch2 == ch_1] - t20_ps
-        # t_ref_1 = t2_ps[ch2 == ch_ref_1]
-        t_2 = t1_ps[ch1 == ch_2] - t10_ps
+        print("g2 prepare2: ", time.time() - t0)
+        t0 = time.time()
+        # t_2 = t1_ps[ch1 == ch_2] - t10_ps
+        t_2 = t1_ps[ch1 == ch_2]
+        t_2 -= np.int64(t10_ps)
+        print("g2 prepare3: ", time.time() - t0)
 
         # ------------------------------------------------------------
         # STEP 2:
@@ -640,9 +652,7 @@ class RealtimeG2Controller:
             exc_value = exc
         else:
             exc_value = None
-        print("g2 fit1 ", time.time() - t0)
 
-        t0 = time.time()
         try:
             fit_parameters = fit_parameter_guess.copy()
             fit_parameters["center"] = float(
@@ -676,7 +686,8 @@ class RealtimeG2Controller:
                 f"g2 fit failed for channels {ch_0}/{ch_2}: {fit_rt.get('message') or 'optimizer did not converge'}"
             )
 
-        print("g2 fit2 ", time.time() - t0)
+        # print("g2 fit: ", time.time() - t0)
+
         T_mid_ps = (t_0[0] + t_0[-1]) / 2
         elapsed_mid_ps = T_mid_ps - state["T_lastmid_ps"]
         if elapsed_mid_ps <= 0:
@@ -687,6 +698,7 @@ class RealtimeG2Controller:
         state["tau_rt_ps"] = fit_rt["center"]
         state["epsilon_ps"] = state["tau_ps"] - state["tau_rt_ps"] / 2
         state["T_lastmid_ps"] = T_mid_ps
+        print("g2 fit: ", time.time() - t0)
 
         return state
 
@@ -774,6 +786,7 @@ class RealtimeG2Controller:
                 )
                 analysis_finished_ns = time.monotonic_ns()
                 # print("Processing: ", time.time() - t0)
+                t0 = time.time()
                 residual_drift_ps_per_s = float(state['u0']) * 1e12
                 self._log_live_tracking_event(
                     'analysis_finished', sequence, analysis_finished_ns,
@@ -860,7 +873,7 @@ class RealtimeG2Controller:
                         self.qcs_clock_adjustment_total_ps_per_s
                     )
                 self._publish()
-                # print("Send: ", time.time() - t0)
+                print("Send: ", time.time() - t0)
             except Exception as exc:
                 message = f'Live analysis/adjustment failed: {exc}'
                 print(f'QCS live tracking error (interval {sequence}): {message}', flush=True)

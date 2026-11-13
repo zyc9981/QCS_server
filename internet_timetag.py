@@ -18,6 +18,9 @@ class InternetCoordinator:
         self.timeout = timeout
         self.lock = threading.Lock()
         self.commands = queue.Queue()
+        self._wakeup_reader, self._wakeup_writer = socket.socketpair()
+        self._wakeup_reader.setblocking(False)
+        self._wakeup_writer.setblocking(False)
         self.closed = threading.Event()
         self.sockets = set()
         self.control_connected = False
@@ -34,6 +37,7 @@ class InternetCoordinator:
         self.remote_start_time_us = None
         self.remote_start_monotonic_us = None
         self.clock_commands = {}
+        self.clock_command_events = {}
         self.status = 'Starting Internet listener...'
         self.thread = threading.Thread(target=self._run, name='internet-control', daemon=True)
         self.thread.start()
@@ -76,6 +80,7 @@ class InternetCoordinator:
                 if oldest_terminal is None:
                     raise RuntimeError('Too many clock commands are awaiting results')
                 del self.clock_commands[oldest_terminal]
+                self.clock_command_events.pop(oldest_terminal, None)
             generation = self.connection_generation
             self.clock_commands[command_id] = {
                 'command_id': command_id,
@@ -85,7 +90,8 @@ class InternetCoordinator:
                 'connection_generation': generation,
                 'result': None,
             }
-            self.commands.put(('set_clock', (command_id, correction, generation)))
+            self.clock_command_events[command_id] = threading.Event()
+            self._queue_command(('set_clock', (command_id, correction, generation)))
         return command_id
 
     def get_clock_command(self, command_id):
@@ -105,6 +111,19 @@ class InternetCoordinator:
                 )
             return snapshot
 
+    def wait_for_clock_command(self, command_id, timeout=None):
+        """Wait for a terminal command update, then return its current snapshot."""
+        with self.lock:
+            command = self.clock_commands.get(command_id)
+            event = getattr(self, 'clock_command_events', {}).get(command_id)
+            if command is None:
+                return None
+            terminal = command['status'] in (
+                'applied', 'failed', 'timed_out', 'connection_lost')
+        if event is not None and not terminal:
+            event.wait(timeout)
+        return self.get_clock_command(command_id)
+
     def _fail_clock_commands(self, generation, status, message):
         with self.lock:
             for command in self.clock_commands.values():
@@ -112,6 +131,9 @@ class InternetCoordinator:
                         and command['status'] in ('queued', 'sent')):
                     command['status'] = status
                     command['message'] = message
+                    event = self.clock_command_events.get(command['command_id'])
+                    if event is not None:
+                        event.set()
 
     def _expire_clock_commands(self):
         now = time.monotonic()
@@ -121,6 +143,9 @@ class InternetCoordinator:
                         and now - command['sent_monotonic'] >= self.timeout):
                     command['status'] = 'timed_out'
                     command['message'] = 'No CLOCK_RESULT received before the control timeout'
+                    event = self.clock_command_events.get(command['command_id'])
+                    if event is not None:
+                        event.set()
 
     def record(self, output, duration=3600, max_bytes=16 * 1024**3):
         if not math.isfinite(duration) or not 0.001 <= duration <= 3600:
@@ -139,7 +164,7 @@ class InternetCoordinator:
             self.started = self.finished = None
             self.remote_start_time_us = self.remote_start_monotonic_us = None
             self.status = 'Requesting Windows recording...'
-            self.commands.put(('record', (self.session, output, duration, max_bytes)))
+            self._queue_command(('record', (self.session, output, duration, max_bytes)))
 
     def record_memory(self, on_data, on_metadata, duration=3600, max_bytes=2**63-1):
         """Receive verified frames through callbacks, without local file writes."""
@@ -155,7 +180,7 @@ class InternetCoordinator:
             self.started = self.finished = None
             self.remote_start_time_us = self.remote_start_monotonic_us = None
             self.status = 'Requesting remote acquisition into local memory...'
-            self.commands.put(('memory', (self.session, on_data, on_metadata, duration, max_bytes)))
+            self._queue_command(('memory', (self.session, on_data, on_metadata, duration, max_bytes)))
 
     def _begin_memory(self, conn, values):
         sid, on_data, on_metadata, duration, maximum = values
@@ -180,7 +205,7 @@ class InternetCoordinator:
                     self.status = ('Memory acquisition complete' if result['status'] == 'complete'
                                    else 'Memory acquisition failed: ' + result.get('error', 'unknown error'))
                 if result['status'] != 'complete':
-                    self.commands.put(('stop', sid))
+                    self._queue_command(('stop', sid))
             except Exception as exc:
                 result = {'status':'incomplete', 'error':str(exc)}
                 with self.lock:
@@ -188,7 +213,7 @@ class InternetCoordinator:
                     self.active = False
                     self.finished = time.monotonic()
                     self.status = 'Memory acquisition failed: ' + str(exc)
-                self.commands.put(('stop', sid))
+                self._queue_command(('stop', sid))
             finally:
                 listener.close()
                 with self.lock:
@@ -206,10 +231,11 @@ class InternetCoordinator:
         with self.lock:
             if self.active:
                 self.status = 'Stopping Internet acquisition; waiting for verified transfer...'
-                self.commands.put(('stop', self.session))
+                self._queue_command(('stop', self.session))
 
     def close(self):
         self.closed.set()
+        self._wake_listener()
         with self.lock:
             sockets = list(self.sockets)
             self.ready = False
@@ -219,6 +245,81 @@ class InternetCoordinator:
             except OSError:
                 pass
             sock.close()
+        for sock in (self._wakeup_reader, self._wakeup_writer):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _queue_command(self, command):
+        """Queue work and wake the control listener if it is in select()."""
+        self.commands.put(command)
+        self._wake_listener()
+
+    def _wake_listener(self):
+        writer = getattr(self, '_wakeup_writer', None)
+        if writer is None:
+            return
+        try:
+            writer.send(b'\x00')
+        except (BlockingIOError, OSError):
+            # A full wakeup socket is already readable; a closed one means the
+            # coordinator is shutting down.
+            pass
+
+    def _drain_wakeup(self):
+        while True:
+            try:
+                if not self._wakeup_reader.recv(4096):
+                    return
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+
+    def _process_queued_commands(self, conn):
+        """Dispatch all queued commands before the listener waits again."""
+        while True:
+            try:
+                kind, values = self.commands.get_nowait()
+            except queue.Empty:
+                return
+
+            if kind == 'record':
+                self._begin(conn, values)
+            elif kind == 'memory':
+                self._begin_memory(conn, values)
+            elif kind == 'stop':
+                send_json(conn, dict(type='STOP', id=values))
+            elif kind == 'set_clock':
+                command_id, correction, generation = values
+                with self.lock:
+                    command = self.clock_commands.get(command_id)
+                    can_send = (self.control_connected
+                                and generation == self.connection_generation
+                                and command is not None
+                                and command['status'] == 'queued')
+                    if can_send:
+                        command['status'] = 'sent'
+                        command['sent_monotonic'] = time.monotonic()
+                if can_send:
+                    send_json(conn, {
+                        'type': 'SET_CLOCK',
+                        'command_id': command_id,
+                        'correction_ps_per_s': correction,
+                    })
+                else:
+                    self._fail_clock_commands(
+                        generation, 'connection_lost',
+                        'Control connection changed before command was sent')
+
+    def _read_control_message(self, conn):
+        readable, _, _ = select.select([conn, self._wakeup_reader], [], [], 0.1)
+        if self._wakeup_reader in readable:
+            self._drain_wakeup()
+        if conn not in readable:
+            return None
+        return read_json(conn)
 
     def _track(self, sock):
         with self.lock:
@@ -260,7 +361,7 @@ class InternetCoordinator:
             self.status = ('Internet complete; SHA-256 verified' if result['status'] == 'complete'
                            else 'Internet incomplete: ' + result.get('error', 'transfer failed'))
             if result['status'] != 'complete':
-                self.commands.put(('stop', sid))
+                self._queue_command(('stop', sid))
             self.sockets.discard(listener)
             self.sockets.discard(connection[0])
 
@@ -312,41 +413,11 @@ class InternetCoordinator:
                     except socket.timeout:
                         continue
                 try:
-                    try:
-                        kind, values = self.commands.get_nowait()
-                    except queue.Empty:
-                        kind = None
-                    if kind == 'record':
-                        self._begin(conn, values)
-                    elif kind == 'memory':
-                        self._begin_memory(conn, values)
-                    elif kind == 'stop':
-                        send_json(conn, dict(type='STOP', id=values))
-                    elif kind == 'set_clock':
-                        command_id, correction, generation = values
-                        with self.lock:
-                            command = self.clock_commands.get(command_id)
-                            can_send = (self.control_connected
-                                        and generation == self.connection_generation
-                                        and command is not None
-                                        and command['status'] == 'queued')
-                            if can_send:
-                                command['status'] = 'sent'
-                                command['sent_monotonic'] = time.monotonic()
-                        if can_send:
-                            send_json(conn, {
-                                'type': 'SET_CLOCK',
-                                'command_id': command_id,
-                                'correction_ps_per_s': correction,
-                            })
-                        else:
-                            self._fail_clock_commands(
-                                generation, 'connection_lost',
-                                'Control connection changed before command was sent')
+                    self._process_queued_commands(conn)
                     self._expire_clock_commands()
-                    if not select.select([conn], [], [], 0.1)[0]:
+                    msg = self._read_control_message(conn)
+                    if msg is None:
                         continue
-                    msg = read_json(conn)
                     if msg.get('type') == 'CLOCK_RESULT':
                         command_id = msg.get('command_id')
                         with self.lock:
@@ -355,6 +426,9 @@ class InternetCoordinator:
                                 command['status'] = 'applied' if msg.get('success') is True else 'failed'
                                 command['result'] = msg
                                 command.pop('message', None)
+                                event = self.clock_command_events.get(command_id)
+                                if event is not None:
+                                    event.set()
                             else:
                                 self.status = f'Received unmatched clock result: {command_id}'
                     elif msg.get('type') == 'ACQ_STARTED':

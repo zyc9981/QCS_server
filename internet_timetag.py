@@ -89,10 +89,21 @@ class InternetCoordinator:
         return command_id
 
     def get_clock_command(self, command_id):
-        """Return the queued/sent state and remote result for one command."""
+        """Return command state, decoded result fields, and the raw remote result."""
         with self.lock:
             command = self.clock_commands.get(command_id)
-            return dict(command) if command is not None else None
+            if command is None:
+                return None
+            snapshot = dict(command)
+            details = command.get('result')
+            if isinstance(details, dict):
+                snapshot['result'] = dict(details)
+                snapshot['message'] = details.get('message') or command.get('message', '')
+                snapshot['applied_correction_ps_per_s'] = details.get('applied_correction_ps_per_s')
+                snapshot['no_change'] = (
+                    command.get('status') == 'applied' and details.get('no_change') is True
+                )
+            return snapshot
 
     def _fail_clock_commands(self, generation, status, message):
         with self.lock:

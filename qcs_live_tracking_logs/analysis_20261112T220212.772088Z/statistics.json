@@ -1,0 +1,79 @@
+{
+  "gain_1_0": {
+    "source": "/home/zyc/QCS/QCS_server/qcs_live_tracking_logs/qcs_live_tracking_20261112T173157.289121Z.csv",
+    "samples": 37,
+    "duration_s": 35.99611071,
+    "command_statuses": {
+      "applied": 35,
+      "stopped": 1
+    },
+    "acquisition_statuses": {
+      "checks passed": 37
+    },
+    "gain_min": 1.0,
+    "gain_max": 1.0,
+    "tau_mean_ps": -1825.8838053743714,
+    "tau_std_ps": 24.709721399554866,
+    "tau_peak_to_peak_ps": 96.76058159615081,
+    "tau_std_after_10_s_ps": 26.689451584175448,
+    "tau_peak_to_peak_after_10_s_ps": 96.76058159615081,
+    "u0_std_excluding_first_ps_per_s": 24.27696248695476,
+    "u0_std_after_10_s_ps_per_s": 26.287159143105725,
+    "u0_min_excluding_first_ps_per_s": -42.53719760408841,
+    "u0_max_excluding_first_ps_per_s": 51.52573823509153,
+    "first_u0_skipped_ps_per_s": -418.6486955562476,
+    "tau_dominant_period_s": 5.728660956529033,
+    "u0_dominant_period_s": 5.769032069682867,
+    "fraction_tau_power_in_5_to_7_s_band": 0.5698395111321911,
+    "mean_acquisition_interval_s": 0.9998919641666668,
+    "std_acquisition_interval_s": 0.006955799198903255,
+    "analysis_delay_mean_s": 0.301885200378379,
+    "ack_delay_mean_s": 0.43247463177142864,
+    "ack_delay_min_s": 0.3306800460000012,
+    "ack_delay_max_s": 0.5752270979999992,
+    "max_command_quantization_error_ps_per_s": 0.17099286130435365,
+    "applied_delta_rms_ps_per_s": 23.806706428272296,
+    "cumulative_applied_live_delta_ps_per_s": -7.389454243014711,
+    "max_u0_derivative_disagreement_ps_per_s": 1.7053025658242404e-13,
+    "interval_index_gaps": 0
+  },
+  "gain_0_3": {
+    "source": "/home/zyc/QCS/QCS_server/qcs_live_tracking_logs/qcs_live_tracking_20261112T220212.772088Z.csv",
+    "samples": 50,
+    "duration_s": 49.011770964,
+    "command_statuses": {
+      "applied": 46,
+      "unchanged (below resolution)": 2,
+      "stopped": 1
+    },
+    "acquisition_statuses": {
+      "checks passed": 50
+    },
+    "gain_min": 0.3,
+    "gain_max": 0.3,
+    "tau_mean_ps": -1953.6574603797726,
+    "tau_std_ps": 23.50799376589393,
+    "tau_peak_to_peak_ps": 99.34242564393571,
+    "tau_std_after_10_s_ps": 22.721665017483936,
+    "tau_peak_to_peak_after_10_s_ps": 86.5242842630621,
+    "u0_std_excluding_first_ps_per_s": 13.607532118321544,
+    "u0_std_after_10_s_ps_per_s": 12.697477004575017,
+    "u0_min_excluding_first_ps_per_s": -41.804065215299424,
+    "u0_max_excluding_first_ps_per_s": 32.827277626587794,
+    "first_u0_skipped_ps_per_s": -431.73911298577735,
+    "tau_dominant_period_s": 15.672911249376677,
+    "u0_dominant_period_s": 6.985029896398808,
+    "fraction_tau_power_in_5_to_7_s_band": 0.08837159916806588,
+    "mean_acquisition_interval_s": 1.0002402237551022,
+    "std_acquisition_interval_s": 0.005666509021108464,
+    "analysis_delay_mean_s": 0.21232671896000035,
+    "ack_delay_mean_s": 0.3347798412083338,
+    "ack_delay_min_s": 0.23124124400000134,
+    "ack_delay_max_s": 0.4230224100000015,
+    "max_command_quantization_error_ps_per_s": 0.17215154274159605,
+    "applied_delta_rms_ps_per_s": 4.122876942370456,
+    "cumulative_applied_live_delta_ps_per_s": 14.074907733030443,
+    "max_u0_derivative_disagreement_ps_per_s": 2.7000623958883807e-13,
+    "interval_index_gaps": 0
+  }
+}

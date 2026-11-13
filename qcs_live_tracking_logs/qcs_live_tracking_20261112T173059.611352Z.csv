@@ -1,0 +1,21 @@
+event,interval,relative_ns,relative_s,tau_ps,u0_ps_per_ps,u0_ps_per_s,T_lastmid_ps,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,4,0,0.000000000,,,,,,,,,checks passed,
+analysis_finished,4,252285641,0.252285641,-1894.144424794461,-4.2589209113331506e-10,-425.89209113331503,4447474992442.5,,,,,,
+clock_adjustment_skipped,4,252650965,0.252650965,-1894.144424794461,-4.2589209113331506e-10,-425.89209113331503,4447474992442.5,,,first live fit is measurement-only,,,
+acquisition_finished,5,998319466,0.998319466,,,,,,,,,checks passed,
+analysis_finished,5,1385734052,1.385734052,-1932.400316199375,-3.7451665457892616e-11,-37.45166545789262,5468948695606.0,,,,,,
+clock_adjustment_finished,5,1540754469,1.540754469,-1932.400316199375,-3.7451665457892616e-11,-37.45166545789262,5468948695606.0,37.45166545789262,37.29799534793465,applied,f600b2df334644dbb2d77660da4ac6cb,,Numerator burst and update strobe completed in 0.034 s; post-adjustment readback was not performed.
+acquisition_finished,6,1999757767,1.999757767,,,,,,,,,checks passed,
+analysis_finished,6,2270336014,2.270336014,-1985.3572093460104,-5.451632866409764e-11,-54.51632866409764,6440343770152.0,,,,,,
+clock_adjustment_finished,6,2373166616,2.373166616,-1985.3572093460104,-5.451632866409764e-11,-54.51632866409764,6440343770152.0,54.51632866409764,54.53949464470989,applied,631b0b812e6e4319888da0f53f37a823,,Numerator burst and update strobe completed in 0.041 s; post-adjustment readback was not performed.
+acquisition_finished,7,2998536767,2.998536767,,,,,,,,,checks passed,
+analysis_finished,7,3217545111,3.217545111,-1985.2520310951222,1.0728700709679877e-13,0.10728700709679877,7420688489744.5,,,,,,
+clock_adjustment_finished,7,3329771888,3.329771888,-1985.2520310951222,1.0728700709679877e-13,0.10728700709679877,7420688489744.5,-0.10728700709679877,0.0,failed,85aab5ea6b744b9cbba43f02f28ec98e,,Correction was below the divider resolution; numerator remained unchanged and no write was sent.
+acquisition_finished,8,4005558530,4.005558530,,,,,,,,,checks passed,
+acquisition_finished,9,5005571948,5.005571948,,,,,,,,,checks passed,
+acquisition_finished,10,6003959623,6.003959623,,,,,,,,,checks passed,
+acquisition_finished,11,7007541539,7.007541539,,,,,,,,,checks passed,
+acquisition_finished,12,8000432724,8.000432724,,,,,,,,,checks passed,
+acquisition_finished,13,8999147712,8.999147712,,,,,,,,,checks passed,
+acquisition_finished,14,10003431096,10.003431096,,,,,,,,,checks passed,
+acquisition_finished,15,10999311295,10.999311295,,,,,,,,,checks passed,

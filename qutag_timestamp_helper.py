@@ -403,10 +403,15 @@ def open_qutag_timestamp_window(app):
     _label(app, tracking_panel, text="QCS live tracking").grid(
         row=0, column=0, sticky="w", padx=12, pady=(8, 4))
     tracking_panel.grid_columnconfigure(0, weight=1)
+    live_parameters = _frame(app, tracking_panel)
+    live_parameters.grid(row=1, column=0, sticky="w", padx=7)
+    qcs_parameter(live_parameters, "correction_gain", "qcs_correction_gain_var",
+                  "qcs_correction_gain_entry", "qcs_correction_gain_text",
+                  f"{DEFAULT_QCS_CONFIG['live_correction_gain']:g}", 0, 0)
     app.qcs_status_var = StringVar(value="Idle — enable Internet and wait for the remote node")
     app.qcs_quality_var = StringVar(value="Live step: waiting for a completed interval")
     for row, variable in enumerate(
-        (app.qcs_status_var, app.qcs_quality_var), start=1
+        (app.qcs_status_var, app.qcs_quality_var), start=2
     ):
         label = _label(app, tracking_panel, textvariable=variable)
         label.configure(wraplength=500, justify="left")
@@ -707,6 +712,7 @@ def _start_qcs(app):
         app.qcs_init_bin_number_var.set(str(init_bin_number))
         controller = RealtimeG2Controller(app, {'acquisition_interval_s': interval,
                                                    'live_clock_adjustment_enabled': True,
+                                                   'live_correction_gain': float(app.qcs_correction_gain_var.get()),
                                                    'init_interval_s': float(app.qcs_init_interval_var.get()),
                                                    'latency_ms': float(app.qcs_latency_ms_var.get()),
                                                    'global_alignment_kwargs': {
@@ -723,6 +729,7 @@ def _start_qcs(app):
         app.qcs_latency_ms_text = app.qcs_latency_ms_var.get()
         app.qcs_init_interval_text = app.qcs_init_interval_var.get()
         app.qcs_interval_text = app.qcs_interval_var.get()
+        app.qcs_correction_gain_text = app.qcs_correction_gain_var.get()
         controller.start()
         app.qcs_controller = controller
         app.qcs_status_var.set(controller.status)
@@ -789,7 +796,10 @@ def _poll_qcs_once(app):
             ):
                 status_prefix = initialization_status.partition(' | command: ')[0]
                 command_id = clock_command.get('command_id')
-                command_label = clock_command['status']
+                command_label = (
+                    'unchanged (below resolution)' if clock_command.get('no_change')
+                    else clock_command['status']
+                )
                 if command_id is not None:
                     command_label += f" #{command_id}"
                 initialization_status = f"{status_prefix} | command: {command_label}"
@@ -830,6 +840,7 @@ def _poll_qcs_once(app):
     app.qcs_latency_ms_entry.configure(state="disabled" if busy else "normal")
     app.qcs_init_interval_entry.configure(state="disabled" if busy else "normal")
     app.qcs_interval_entry.configure(state="disabled" if busy else "normal")
+    app.qcs_correction_gain_entry.configure(state="disabled" if busy else "normal")
     app.qcs_start_button.configure(state="disabled" if busy else "normal")
     app.qcs_stop_button.configure(state="normal" if busy else "disabled")
     app.qutag_timestamp_start_writing_button.configure(

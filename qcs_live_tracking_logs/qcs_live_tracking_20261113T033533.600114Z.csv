@@ -1,0 +1,31 @@
+event,interval,relative_s,tau_ps,u0_ps_per_s,T_lastmid_ms,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,3,0.000000000,,,,,,,,checks passed,
+analysis_finished,3,1.091429717,-1870.0563304082784,-383.37649502785507,4877.858592432501,,,,,,
+clock_adjustment_skipped,3,1.091890706,-1870.0563304082784,-383.37649502785507,4877.858592432501,,,first live fit is measurement-only,,,
+acquisition_finished,4,1.992507983,,,,,,,,checks passed,
+analysis_finished,4,2.321537572,-1851.9007929340016,9.163420745951411,6859.164261748,,,,,,
+clock_adjustment_finished,4,2.476020318,-1851.9007929340016,9.163420745951411,6859.164261748,-0.9163420745951412,-1.0555562387146167,applied,9055edd9d15e4d058d677ece257f0307,,Numerator burst and update strobe completed in 0.055 s; post-adjustment readback was not performed.
+acquisition_finished,5,3.989969908,,,,,,,,checks passed,
+analysis_finished,5,4.322289024,-1799.5299139491622,26.048483760226713,8869.6797092845,,,,,,
+clock_adjustment_finished,5,4.475234427,-1799.5299139491622,26.048483760226713,8869.6797092845,-2.6048483760226713,-2.4630277524022306,applied,64593dfc6a504eb484b0cad64b1300dd,,Numerator burst and update strobe completed in 0.053 s; post-adjustment readback was not performed.
+acquisition_finished,6,5.993966234,,,,,,,,checks passed,
+analysis_finished,6,6.296562495,-1749.6958904447179,24.90807056066073,10870.397644585,,,,,,
+clock_adjustment_finished,6,6.407905225,-1749.6958904447179,24.90807056066073,10870.397644585,-2.490807056066073,-2.4630695377621246,applied,ab8a1e8b5f4c40818e12771b95fc0bf3,,Numerator burst and update strobe completed in 0.039 s; post-adjustment readback was not performed.
+acquisition_finished,7,7.989970982,,,,,,,,checks passed,
+analysis_finished,7,8.302513740,-1707.9180409144726,20.995363774818475,12860.2583575655,,,,,,
+clock_adjustment_finished,7,8.405640048,-1707.9180409144726,20.995363774818475,12860.2583575655,-2.0995363774818476,-2.111243956610942,applied,b80c88124cdc449bb0000ea3f69cdb91,,Numerator burst and update strobe completed in 0.048 s; post-adjustment readback was not performed.
+acquisition_finished,8,9.996653955,,,,,,,,checks passed,
+analysis_finished,8,10.290510009,-1694.0477032349982,6.9338302882661,14860.6444505085,,,,,,
+clock_adjustment_finished,8,10.396438720,-1694.0477032349982,6.9338302882661,14860.6444505085,-0.6933830288266101,-0.7037785859746737,applied,c471250cd2de41dab56b3d9dcb1de85a,,Numerator burst and update strobe completed in 0.042 s; post-adjustment readback was not performed.
+acquisition_finished,9,11.998774318,,,,,,,,checks passed,
+analysis_finished,9,12.307520288,-1676.1807411268821,8.931629784718153,16861.058992845003,,,,,,
+clock_adjustment_finished,9,12.459627456,-1676.1807411268821,8.931629784718153,16861.058992845003,-0.8931629784718154,-1.0556103101529157,applied,0790679b1fd84e4283672d9b6f457e32,,Numerator burst and update strobe completed in 0.048 s; post-adjustment readback was not performed.
+acquisition_finished,10,13.991581405,,,,,,,,checks passed,
+analysis_finished,10,14.278526739,-1643.854034135517,16.229396526884962,18852.920300677,,,,,,
+clock_adjustment_finished,10,14.379725335,-1643.854034135517,16.229396526884962,18852.920300677,-1.6229396526884963,-1.7593470908079667,applied,c6520b13b6314d7cb63b26ab5c68cc9a,,Numerator burst and update strobe completed in 0.047 s; post-adjustment readback was not performed.
+acquisition_finished,11,15.989671295,,,,,,,,checks passed,
+analysis_finished,11,16.316579661,-1595.3673559654515,23.75846098746733,20893.737599223503,,,,,,
+clock_adjustment_finished,11,16.419281017,-1595.3673559654515,23.75846098746733,20893.737599223503,-2.375846098746733,-2.463048229133652,applied,9c0bbf05616a41399d80a9431affdda5,,Numerator burst and update strobe completed in 0.041 s; post-adjustment readback was not performed.
+acquisition_finished,12,18.001760814,,,,,,,,checks passed,
+analysis_finished,12,18.302795759,-1549.740022040078,22.605202831569684,22912.181506378,,,,,,
+clock_adjustment_finished,12,18.404227290,-1549.740022040078,22.605202831569684,22912.181506378,-2.2605202831569686,-2.1112226479512444,applied,95874617ae5d4646a57bc9afdc8e4012,,Numerator burst and update strobe completed in 0.049 s; post-adjustment readback was not performed.

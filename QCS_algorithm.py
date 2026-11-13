@@ -1,11 +1,13 @@
 """Live in-memory QCS acquisition, alignment, and interval clock tracking."""
 from __future__ import annotations
 
+import csv
 from collections import deque
 import queue
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 from numba import njit
 from qcs_analyzer._implementation import *
@@ -27,6 +29,8 @@ DEFAULT_QCS_CONFIG = {
     'fine_steps': 20,
     'fine_sweep_range_ps_per_s': 100.0,
 
+    # Temporary diagnostic gain; restore 1.0 for full live correction.
+    'live_correction_gain': 0.1,
 }
 
 MAX_TAU_HISTORY = 86_400
@@ -180,6 +184,10 @@ class RealtimeG2Controller:
         self.live_clock_adjustment_enabled = (
             self.config.get('live_clock_adjustment_enabled', True) is True
         )
+        self.live_correction_gain = float(self.config.get(
+            'live_correction_gain', DEFAULT_QCS_CONFIG['live_correction_gain']))
+        if not np.isfinite(self.live_correction_gain) or self.live_correction_gain <= 0:
+            raise ValueError('live_correction_gain must be positive and finite')
         alignment_options = dict(self.config.get('global_alignment_kwargs', {}))
         alignment_options.setdefault(
             'sweep_range_ps_per_s', DEFAULT_QCS_CONFIG['sweep_range_ps_per_s'])
@@ -223,13 +231,19 @@ class RealtimeG2Controller:
         self.live_t10_ps = None
         self.live_t20_ps = None
         self.calibrated_offset_ps = None
-        self.current_clock_setpoint_ps_per_s = None
+        # Cumulative QCS-applied deltas relative to the node's clock setting
+        # at the start of this session; node commands themselves are deltas.
+        self.qcs_clock_adjustment_total_ps_per_s = 0.0
         self.live_step_result = None
         self.live_analysis_steps = 0
         self.tau_time_s_history = np.full(MAX_TAU_HISTORY, np.nan, dtype=np.float64)
         self.tau_ps_history = np.full(MAX_TAU_HISTORY, np.nan, dtype=np.float64)
         self.tau_history_count = 0
         self.tau_history_version = 0
+        self.live_log_origin_ns = None
+        self.live_log_path = None
+        self.live_log_lock = threading.Lock()
+        self.live_log_error_reported = False
         legacy_limit = self.config.get('max_events_per_source')
         self.max_events = {
             'ttx': int(self.config.get('max_events_ttx', legacy_limit or 10_000_000)),
@@ -352,7 +366,8 @@ class RealtimeG2Controller:
         with self.lock:
             if self.stop_event.is_set():
                 return
-            completed = self._rotate_interval_locked(time.monotonic())
+            now_ns = time.monotonic_ns()
+            completed = self._rotate_interval_locked(now_ns * 1e-9, now_ns)
             previous = self.last_timestamp[source]
             if previous is not None and times[0] < previous:
                 self.interval_order_errors.append(f'{source}: timestamps moved backwards between batches')
@@ -380,7 +395,7 @@ class RealtimeG2Controller:
         if completed is not None:
             self._handle_completed_interval(completed)
 
-    def _rotate_interval_locked(self, now):
+    def _rotate_interval_locked(self, now, now_ns=None):
         """Swap buffers atomically; callers must hold self.lock.
 
         Intervals currently use local arrival time, not device time. Remote
@@ -400,6 +415,8 @@ class RealtimeG2Controller:
         self.next_interval_end += elapsed * self.acquisition_interval_s
         interval = dict(buffers=completed, sequence=self.completed_intervals,
                         initialization=self.completed_intervals == elapsed,
+                        finished_monotonic_ns=(int(now_ns) if now_ns is not None
+                                               else time.monotonic_ns()),
                         drops=self.interval_evicted, order_errors=self.interval_order_errors)
         self.interval_evicted = dict(ttx=0, hh=0)
         self.interval_order_errors = []
@@ -448,18 +465,25 @@ class RealtimeG2Controller:
                     self.initialization_worker.start()
                 else:
                     self.initialization_status = 'Initialization failed: ' + status + '; ' + '; '.join(report['reasons'])
-            elif status == 'checks passed' and not self.integrity_failure and not self.stop_event.is_set():
+            elif not completed['initialization']:
                 # Skip intervals until the initial clock write is acknowledged,
                 # including the interval that overlaps the write itself.
                 with self.lock:
                     live_ready = self.initial_clock_adjustment_applied
                     discard_through = self.live_discard_through_sequence
                 if live_ready and completed['sequence'] > discard_through:
-                    try:
-                        self.live_interval_queue.put_nowait((completed['sequence'], arrays))
-                    except queue.Full:
-                        self._record_integrity_failure(
-                            'Live analysis fell behind; a completed interval could not be queued')
+                    acquired_ns = completed['finished_monotonic_ns']
+                    self._log_live_tracking_event(
+                        'acquisition_finished', completed['sequence'], acquired_ns,
+                        acquisition_status=status,
+                        details='; '.join(report['reasons']),
+                    )
+                    if status == 'checks passed' and not self.integrity_failure and not self.stop_event.is_set():
+                        try:
+                            self.live_interval_queue.put_nowait((completed['sequence'], arrays))
+                        except queue.Full:
+                            self._record_integrity_failure(
+                                'Live analysis fell behind; a completed interval could not be queued')
         finally:
             completed['buffers'].clear()
 
@@ -536,6 +560,7 @@ class RealtimeG2Controller:
         t_1 = t2_ps[ch2 == ch_1] - t20_ps
         # t_ref_1 = t2_ps[ch2 == ch_ref_1]
         t_2 = t1_ps[ch1 == ch_2] - t10_ps
+        # print("TTX: ", t_0[0], "HH: ", t_1[0])
 
         # ------------------------------------------------------------
         # STEP 2:
@@ -659,6 +684,43 @@ class RealtimeG2Controller:
             self.tau_history_count += 1
             self.tau_history_version += 1
 
+    def _log_live_tracking_event(self, event, sequence, event_monotonic_ns, **values):
+        """Append a structured event with time relative to the first live interval."""
+        fields = (
+            'event', 'interval', 'relative_s', 'tau_ps',
+            'u0_ps_per_s', 'T_lastmid_ms',
+            'correction_ps_per_s', 'applied_correction_ps_per_s',
+            'clock_status', 'command_id', 'acquisition_status', 'details',
+        )
+        try:
+            with self.live_log_lock:
+                if self.live_log_origin_ns is None:
+                    origin_ns = int(event_monotonic_ns)
+                    log_dir = Path(__file__).resolve().parent / 'qcs_live_tracking_logs'
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+                    log_path = log_dir / f'qcs_live_tracking_{stamp}.csv'
+                    with log_path.open('w', newline='', encoding='utf-8') as file:
+                        csv.DictWriter(file, fieldnames=fields).writeheader()
+                    self.live_log_path = log_path
+                    self.live_log_origin_ns = origin_ns
+                    print(f'QCS live tracking log: {self.live_log_path}', flush=True)
+
+                relative_ns = int(event_monotonic_ns) - self.live_log_origin_ns
+                row = {
+                    'event': event,
+                    'interval': int(sequence),
+                    'relative_s': f'{relative_ns * 1e-9:.9f}',
+                }
+                row.update(values)
+                with self.live_log_path.open('a', newline='', encoding='utf-8') as file:
+                    csv.DictWriter(file, fieldnames=fields).writerow(row)
+                    file.flush()
+        except Exception as exc:
+            if not self.live_log_error_reported:
+                self.live_log_error_reported = True
+                print(f'QCS live tracking logger failed: {exc}', flush=True)
+
     def tau_history_snapshot(self, known_version=-1):
         """Return a stable copy of new history data for the GUI thread."""
         with self.lock:
@@ -681,6 +743,8 @@ class RealtimeG2Controller:
             try:
                 if item is None:
                     return
+
+                # t0 = time.time()
                 sequence, arrays = item
                 (t1_ps, ch1), (t2_ps, ch2) = arrays['ttx'], arrays['hh']
                 if self.live_state is None or self.live_t10_ps is None or self.live_t20_ps is None:
@@ -691,11 +755,20 @@ class RealtimeG2Controller:
                     t10_ps=self.live_t10_ps,
                     t20_ps=self.live_t20_ps,
                 )
+                analysis_finished_ns = time.monotonic_ns()
+                # print("Processing: ", time.time() - t0)
+                residual_drift_ps_per_s = float(state['u0']) * 1e12
+                self._log_live_tracking_event(
+                    'analysis_finished', sequence, analysis_finished_ns,
+                    tau_ps=state['tau_ps'],
+                    u0_ps_per_s=residual_drift_ps_per_s,
+                    T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                )
+
                 self.live_state = state
                 self._append_tau_history(state['T_lastmid_ps'] * 1e-12, state['tau_ps'])
                 self.live_analysis_steps += 1
                 first_live_step = self.live_analysis_steps == 1
-                residual_drift_ps_per_s = float(state['u0']) * 1e12
                 with self.lock:
                     self.live_step_result = {
                         'sequence': int(sequence),
@@ -709,35 +782,68 @@ class RealtimeG2Controller:
                 if first_live_step:
                     # Use the first live fit as a measurement only. Start
                     # applying interval corrections from the next fit onward.
+                    self._log_live_tracking_event(
+                        'clock_adjustment_skipped', sequence, time.monotonic_ns(),
+                        tau_ps=state['tau_ps'],
+                        u0_ps_per_s=residual_drift_ps_per_s,
+                        T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                        clock_status='first live fit is measurement-only',
+                    )
                     continue
                 if not self.live_clock_adjustment_enabled:
                     with self.lock:
                         self.live_step_result['clock_status'] = 'disabled'
                     self._publish()
+                    self._log_live_tracking_event(
+                        'clock_adjustment_skipped', sequence, time.monotonic_ns(),
+                        tau_ps=state['tau_ps'],
+                        u0_ps_per_s=residual_drift_ps_per_s,
+                        T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                        clock_status='live clock adjustment disabled',
+                    )
                     continue
 
-                # The remote node accepts an absolute correction relative to
-                # nominal. Apply the opposite of measured u0 as a delta while
-                # retaining the global-alignment setpoint already in effect.
-                target_ps_per_s = (
-                    float(self.current_clock_setpoint_ps_per_s) - residual_drift_ps_per_s
-                )
-                command_id = self._send_clock_adjustment(target_ps_per_s)
+                # The node treats each command as a signed increment to its
+                # current clock correction. Scale the opposite residual by
+                # the diagnostic feedback gain; fitted u0 remains unscaled.
+                correction_ps_per_s = -self.live_correction_gain * residual_drift_ps_per_s
+                command_id = self._send_clock_adjustment(correction_ps_per_s)
                 command_result = self._wait_for_clock_adjustment(command_id)
+                clock_finished_ns = time.monotonic_ns()
+                command_result_details = command_result.get('result') or {}
+                self._log_live_tracking_event(
+                    'clock_adjustment_finished', sequence, clock_finished_ns,
+                    tau_ps=state['tau_ps'],
+                    u0_ps_per_s=residual_drift_ps_per_s,
+                    T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                    correction_ps_per_s=correction_ps_per_s,
+                    applied_correction_ps_per_s=command_result_details.get(
+                        'applied_correction_ps_per_s'),
+                    clock_status=('unchanged (below resolution)' if command_result.get('no_change')
+                                  else command_result.get('status')),
+                    command_id=command_id,
+                    details=command_result_details.get('message', ''),
+                )
                 if command_result.get('status') != 'applied':
                     raise RuntimeError(
                         f"Clock command {command_id}: {command_result.get('status')}: "
                         f"{command_result.get('message', '')}")
                 applied = command_result.get('applied_correction_ps_per_s')
-                self.current_clock_setpoint_ps_per_s = (
-                    float(applied) if applied is not None else target_ps_per_s
+                applied_delta_ps_per_s = (
+                    float(applied) if applied is not None else correction_ps_per_s
                 )
+                self.qcs_clock_adjustment_total_ps_per_s += applied_delta_ps_per_s
                 with self.lock:
-                    self.live_step_result['clock_status'] = 'adjustment applied'
-                    self.live_step_result['clock_setpoint_ps_per_s'] = (
-                        self.current_clock_setpoint_ps_per_s
+                    self.live_step_result['clock_status'] = (
+                        'unchanged (below resolution)' if command_result.get('no_change')
+                        else 'adjustment applied'
+                    )
+                    self.live_step_result['applied_clock_delta_ps_per_s'] = applied_delta_ps_per_s
+                    self.live_step_result['qcs_clock_adjustment_total_ps_per_s'] = (
+                        self.qcs_clock_adjustment_total_ps_per_s
                     )
                 self._publish()
+                # print("Send: ", time.time() - t0)
             except Exception as exc:
                 message = f'Live analysis/adjustment failed: {exc}'
                 print(f'QCS live tracking error (interval {sequence}): {message}', flush=True)
@@ -808,13 +914,18 @@ class RealtimeG2Controller:
                     command_state = command_result.get('status', 'unknown')
                     if command_state == 'applied':
                         adjustment_applied = True
-                        command_summary = f'applied #{command_id}'
-                        clock_status = f'applied command {command_id}'
+                        if command_result.get('no_change'):
+                            command_summary = f'unchanged #{command_id}'
+                            clock_status = f'unchanged (below resolution), command {command_id}'
+                        else:
+                            command_summary = f'applied #{command_id}'
+                            clock_status = f'applied command {command_id}'
                         applied = command_result.get('applied_correction_ps_per_s')
-                        self.current_clock_setpoint_ps_per_s = (
+                        applied_delta_ps_per_s = (
                             float(applied) if applied is not None
                             else float(result['skew_ps_per_s'])
                         )
+                        self.qcs_clock_adjustment_total_ps_per_s += applied_delta_ps_per_s
                     else:
                         command_summary = f'{command_state} #{command_id}'
                         clock_status = (
@@ -857,7 +968,7 @@ class RealtimeG2Controller:
                     self.live_state = {
                         'time_bin_ps': 20.0,
                         'time_bin_rt_ps': 20.0,
-                        'tau_span_ps': 1_000_000.0,
+                        'tau_span_ps': 500_000.0,
                         'tau_ps': 0.0,
                         'tau_rt_ps': 58_968_630.0,
                         'epsilon_ps': 0.0,
@@ -914,7 +1025,8 @@ class RealtimeG2Controller:
                 if reader is not None:
                     self._read_ttx(reader)
                 with self.lock:
-                    completed = self._rotate_interval_locked(time.monotonic())
+                    now_ns = time.monotonic_ns()
+                    completed = self._rotate_interval_locked(now_ns * 1e-9, now_ns)
                 if completed is not None:
                     self._handle_completed_interval(completed)
                 state = self.remote.snapshot()

@@ -628,7 +628,8 @@ class RealtimeG2Controller:
                 results,
                 curve=fit_curve,
                 parameters=fit_parameters,
-                fit_window=np.rint(float(1e12)/Freq) * 1.0,
+                # fit_window=np.rint(float(1e12)/Freq) * 1.0,
+                fit_window=2_000,
                 show=show_fit,
             )
         except Exception as exc:
@@ -652,7 +653,8 @@ class RealtimeG2Controller:
                 results_rt,
                 curve=fit_curve,
                 parameters=fit_parameters,
-                fit_window=np.rint(float(1e12)/Freq) * 1.0,
+                # fit_window=np.rint(float(1e12)/Freq) * 1.0,
+                fit_window=2_000,
                 show=show_fit,
                 # show=True,
             )

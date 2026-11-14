@@ -13,6 +13,10 @@ from pathlib import Path
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+if __package__:
+    from .timestamp_math import integer_scalar, integer_resolution_ps
+else:  # Preserve direct script execution.
+    from timestamp_math import integer_scalar, integer_resolution_ps
 from tkinter import Tk, filedialog
 from scipy.fft import fft, fftshift, fftfreq, ifft, ifftshift
 from scipy.special import erfc, erfcx, erf
@@ -425,9 +429,7 @@ def _iter_hydraharp_qsfp_chunks(
     """
     if not isinstance(chunk_size, (int, np.integer)) or chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer.")
-    resolution = float(base_resolution_ps)
-    if not np.isfinite(resolution) or resolution <= 0 or not resolution.is_integer():
-        raise ValueError("hydraharp_base_resolution_ps must be a positive integer in ps.")
+    resolution = integer_resolution_ps(base_resolution_ps)
     if Path(filename).stat().st_size % 4:
         raise ValueError(f"HydraHarp QSFP file ends with an incomplete 32-bit T2 record: {filename}")
 
@@ -446,9 +448,7 @@ def _iter_hydraharp_qsfp_chunks(
 def decode_hydraharp_t2_records(records, overflow_correction=0, channel_offset=0,
                                 base_resolution_ps=1):
     """Decode one V2 T2 block, retaining overflow state across block boundaries."""
-    resolution = float(base_resolution_ps)
-    if not np.isfinite(resolution) or resolution <= 0 or not resolution.is_integer():
-        raise ValueError("HydraHarp base resolution must be a positive integer in ps")
+    resolution = integer_resolution_ps(base_resolution_ps)
     records = np.asarray(records, dtype="<u4")
     if not len(records):
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), overflow_correction
@@ -457,10 +457,19 @@ def decode_hydraharp_t2_records(records, overflow_correction=0, channel_offset=0
     timetags = (records & 0x1FFFFFF).astype(np.int64)
     overflow = special & (channels == 63)
     overflow_counts = np.where(overflow, np.maximum(timetags, 1), 0)
+    # Check with Python integers before cumsum/scale can wrap in int64.
+    overflow_correction = integer_scalar(overflow_correction, 'HH overflow correction')
+    maximum_ticks = np.iinfo(np.int64).max // int(resolution)
+    next_overflow = overflow_correction + int(overflow_counts.sum(dtype=np.int64)) * (1 << 25)
+    if overflow_correction < 0 or next_overflow > maximum_ticks:
+        raise OverflowError('HydraHarp overflow state exceeds the int64 picosecond range')
     corrections = np.cumsum(overflow_counts, dtype=np.int64) * (1 << 25)
     corrections += overflow_correction
     overflow_correction = int(corrections[-1])
     events = ~special | (channels == 0)
+    if next_overflow > maximum_ticks - (1 << 25):
+        if np.any(timetags[events] > maximum_ticks - corrections[events]):
+            raise OverflowError('HydraHarp timestamps exceed the int64 picosecond range')
     times = (timetags + corrections)[events]
     if len(times) and times.max() > np.iinfo(np.int64).max // int(resolution):
         raise ValueError("HydraHarp timestamps exceed the int64 picosecond range")

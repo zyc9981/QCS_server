@@ -1,0 +1,5 @@
+event,interval,relative_s,tau_ps,u0_ps_per_s,tau_rt_ps,u0_rt_ps_per_s,T_lastmid_ms,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,3,0.000000000,,,,,,,,,,checks passed,
+non_rt_processing_started,3,0.003751386,0.0,,,,0.0,,,,,,
+acquisition_finished,4,1.996313705,,,,,,,,,,checks passed,
+acquisition_finished,5,3.997915675,,,,,,,,,,checks passed,

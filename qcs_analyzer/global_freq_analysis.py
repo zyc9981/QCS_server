@@ -7,6 +7,10 @@ import time
 
 import numpy as np
 from numba import njit
+if __package__:
+    from .timestamp_math import int64_timestamps, shift_picoseconds
+else:
+    from timestamp_math import int64_timestamps, shift_picoseconds
 
 
 @njit(nogil=True, cache=True)
@@ -443,6 +447,8 @@ def global_freq_alignment_g2(
         raise ValueError("Both timestamp arrays must contain at least two events.")
     if not np.issubdtype(first.dtype, np.integer) or not np.issubdtype(second.dtype, np.integer):
         raise TypeError("Timestamp inputs must be integer picoseconds.")
+    first = int64_timestamps(first, 'alignment first timestamps')
+    second = int64_timestamps(second, 'alignment second timestamps')
     if not np.all(np.isfinite(first)) or not np.all(np.isfinite(second)):
         raise ValueError("Timestamp arrays must contain only finite values.")
 
@@ -516,14 +522,19 @@ def global_freq_alignment_g2(
     # ------------------------------------------------------------------
     first = np.sort(first)
     second = np.sort(second)
-    time_origin_ps = min(first[0], second[0])
+    time_origin_ps = min(int(first[0]), int(second[0]))
     # Subtract the common origin while timestamps are still integers. The
     # resulting relative times are short enough for float64 to represent each
     # picosecond exactly; only the subsequent skew model can be fractional.
-    first_ps = (first - time_origin_ps).astype(np.float64)
-    second_ps = (second - time_origin_ps).astype(np.float64)
+    first_relative_ps = shift_picoseconds(first, -time_origin_ps)
+    second_relative_ps = shift_picoseconds(second, -time_origin_ps)
+    if max(int(first_relative_ps[-1]), int(second_relative_ps[-1])) > 1 << 53:
+        raise ValueError('Alignment span exceeds the exact float64 integer-picosecond range')
+    first_ps = first_relative_ps.astype(np.float64)
+    second_ps = second_relative_ps.astype(np.float64)
     correction_reference_ps = float(second_ps[0])
-    second_elapsed_ps = (second - second[0]).astype(np.float64)
+    second_elapsed_ps = shift_picoseconds(second, -int(second[0])).astype(np.float64)
+    del first_relative_ps, second_relative_ps
     duration_ps = max(float(first_ps[-1]), float(second_ps[-1]))
     if duration_ps <= 0:
         raise ValueError("Each timestamp array must span a positive duration.")
@@ -810,7 +821,7 @@ def global_freq_alignment_g2(
         "background_counts": best["background"],
         "bin_width_ps": bin_width_ps,
         "duration_s": acquisition_duration_s,
-        "time_origin_ps": time_origin_ps.item(),
+        "time_origin_ps": time_origin_ps,
         "correction_reference_ps": correction_reference_ps,
         "init_time_offset_range_ms": (
             float(range_value)

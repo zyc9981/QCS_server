@@ -1,0 +1,26 @@
+event,interval,relative_s,tau_ps,u0_ps_per_s,tau_rt_ps,u0_rt_ps_per_s,T_lastmid_ms,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,13,0.000000000,,,,,,,,,,checks passed,
+non_rt_processing_started,13,0.002964802,0.0,,,,0.0,,,,,,
+non_rt_processing_finished,13,0.847229274,-205.77659501138285,-8.275977188991355,,,24864.326026068,,,,,,
+clock_adjustment_skipped,13,0.849116543,-205.77659501138285,-8.275977188991355,,,24864.326026068,,,first live fit is measurement-only,,,
+rt_processing_finished,13,0.872336801,,,58967765.085050225,-34.78537680321425,24864.326026068,,,,,,
+acquisition_finished,14,2.014429961,,,,,,,,,,checks passed,
+non_rt_processing_started,14,2.019052228,-205.77659501138285,,,,24864.326026068,,,,,,
+non_rt_processing_finished,14,2.042341112,-122.60774856793897,40.59041149362236,,,26913.303688108,,,,,,
+clock_adjustment_finished,14,2.082002251,-122.60774856793897,40.59041149362236,,,26913.303688108,-4.059041149362236,-4.222453913543811,applied,afd09086285241b4a87786e50fef2ca0,,Numerator burst and update strobe completed in 0.035 s; post-adjustment readback was not performed.
+rt_processing_finished,14,2.107789527,,,58967769.25991103,2.0375335869286575,26913.303688108,,,,,,
+acquisition_finished,15,4.003258751,,,,,,,,,,checks passed,
+non_rt_processing_started,15,4.004729954,-122.60774856793897,,,,26913.303688108,,,,,,
+non_rt_processing_finished,15,4.031881165,10.169787538026949,66.06195968330353,,,28923.197683722003,,,,,,
+clock_adjustment_finished,15,4.070271674,10.169787538026949,66.06195968330353,,,28923.197683722003,-6.606195968330353,-6.685533670110905,applied,fad1e4bdd4804889b9eb513e7f20f415,,Numerator burst and update strobe completed in 0.034 s; post-adjustment readback was not performed.
+rt_processing_finished,15,4.095759603,,,58967770.00193516,0.36918570468815753,28923.197683722003,,,,,,
+acquisition_finished,16,6.001851512,,,,,,,,,,checks passed,
+non_rt_processing_started,16,6.006207842,10.169787538026949,,,,28923.197683722003,,,,,,
+non_rt_processing_finished,16,6.040662565,125.88839128048483,58.43971956464396,,,30903.333875417004,,,,,,
+clock_adjustment_finished,16,6.088997059,125.88839128048483,58.43971956464396,,,30903.333875417004,-5.843971956464396,-5.981737891135736,applied,e111ea1d930a4343bba34a4098918e8b,,Numerator burst and update strobe completed in 0.043 s; post-adjustment readback was not performed.
+rt_processing_finished,16,6.133957286,,,58967766.468194254,-1.7845948792454511,30903.333875417004,,,,,,
+acquisition_finished,17,8.004358254,,,,,,,,,,checks passed,
+non_rt_processing_started,17,8.006850406,125.88839128048483,,,,30903.333875417004,,,,,,
+non_rt_processing_finished,17,8.065837126,197.05100890013887,36.12417882716199,,,32873.278104741505,,,,,,
+clock_adjustment_finished,17,8.128620748,197.05100890013887,36.12417882716199,,,32873.278104741505,-3.6124178827161995,-3.5186409218512793,applied,f17915341d3f41f5a5318a5b3ea444d8,,Numerator burst and update strobe completed in 0.056 s; post-adjustment readback was not performed.
+rt_processing_finished,17,8.152418838,,,58967772.89259883,3.2612113991794236,32873.278104741505,,,,,,

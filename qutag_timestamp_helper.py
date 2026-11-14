@@ -408,6 +408,14 @@ def open_qutag_timestamp_window(app):
     qcs_parameter(live_parameters, "correction_gain", "qcs_correction_gain_var",
                   "qcs_correction_gain_entry", "qcs_correction_gain_text",
                   f"{DEFAULT_QCS_CONFIG['live_correction_gain']:g}", 0, 0)
+    app.qcs_clock_adjustment_var = BooleanVar(
+        value=getattr(app, 'qcs_live_clock_adjustment_enabled', True))
+    app.qcs_clock_adjustment_checkbox = _checkbutton(
+        app, live_parameters, text="Send clock adjustment",
+        variable=app.qcs_clock_adjustment_var,
+        command=lambda: _toggle_qcs_clock_adjustment(app))
+    app.qcs_clock_adjustment_checkbox.grid(
+        row=0, column=1, sticky="w", padx=(12, 5), pady=6)
     app.qcs_status_var = StringVar(value="Idle — enable Internet and wait for the remote node")
     app.qcs_quality_var = StringVar(value="Live step: waiting for a completed interval")
     for row, variable in enumerate(
@@ -711,10 +719,10 @@ def _start_qcs(app):
         app.qcs_fine_steps_var.set(str(fine_steps))
         app.qcs_init_bin_number_var.set(str(init_bin_number))
         controller = RealtimeG2Controller(app, {'acquisition_interval_s': interval,
-                                                   'live_clock_adjustment_enabled': True,
+                                                   'live_clock_adjustment_enabled': bool(app.qcs_clock_adjustment_var.get()),
                                                    'live_correction_gain': float(app.qcs_correction_gain_var.get()),
                                                    'init_interval_s': float(app.qcs_init_interval_var.get()),
-                                                   'latency_ms': float(app.qcs_latency_ms_var.get()),
+                                                   'latency_ms': app.qcs_latency_ms_var.get().strip(),
                                                    'global_alignment_kwargs': {
                                                        'coarse_steps': sweep_num,
                                                        'fine_steps': fine_steps,
@@ -735,6 +743,15 @@ def _start_qcs(app):
         app.qcs_status_var.set(controller.status)
     except Exception as exc:
         messagebox.showerror("QCS acquisition", str(exc), parent=app.qutag_timestamp_win)
+
+
+def _toggle_qcs_clock_adjustment(app):
+    """Apply the checkbox immediately to the active live-tracking session."""
+    enabled = bool(app.qcs_clock_adjustment_var.get())
+    app.qcs_live_clock_adjustment_enabled = enabled
+    controller = getattr(app, 'qcs_controller', None)
+    if controller is not None:
+        controller.set_live_clock_adjustment_enabled(enabled)
 
 
 def _stop_qcs(app):

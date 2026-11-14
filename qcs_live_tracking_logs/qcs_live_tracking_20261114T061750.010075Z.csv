@@ -1,0 +1,11 @@
+event,interval,relative_s,tau_ps,u0_ps_per_s,tau_rt_ps,u0_rt_ps_per_s,T_lastmid_ms,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,3,0.000000000,,,,,,,,,,checks passed,
+non_rt_processing_started,3,0.004849983,0.0,,,,0.0,,,,,,
+non_rt_processing_finished,3,0.046889356,-163465.30839651226,-33444.84524642619,,,4887.608454818001,,,,,,
+clock_adjustment_skipped,3,0.047152333,-163465.30839651226,-33444.84524642619,,,4887.608454818001,,,first live fit is measurement-only,,,
+rt_processing_finished,3,0.065723227,,,58967758.167112514,-178.3761722210393,4887.608454818001,,,,,,
+acquisition_finished,4,1.996948650,,,,,,,,,,checks passed,
+non_rt_processing_started,4,2.000966098,-163465.30839651226,,,,4887.608454818001,,,,,,
+non_rt_processing_finished,4,2.030818581,-182298.576123915,-9458.884836135183,,,6878.674849395001,,,,,,
+clock_adjustment_skipped,4,2.031193695,-182298.576123915,-9458.884836135183,,,6878.674849395001,,,live clock adjustment disabled,,,
+rt_processing_finished,4,2.053187301,,,58967765.03188322,3.447785931054361,6878.674849395001,,,,,,

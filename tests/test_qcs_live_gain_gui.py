@@ -28,7 +28,17 @@ class LiveGainGuiTests(unittest.TestCase):
         }.items():
             setattr(app, f'qcs_{name}_var', Value(text))
         app.qcs_status_var = Value('Idle')
+        app.qcs_clock_adjustment_var = Value(True)
         return app
+
+    def test_decimal_latency_is_forwarded_without_float_rounding(self):
+        app = self.app('0.45')
+        app.qcs_latency_ms_var.set('9007199.254740993')
+        with patch.object(RealtimeG2Controller, 'start'), \
+                patch('qutag_timestamp_helper.messagebox.showerror') as error:
+            _start_qcs(app)
+        error.assert_not_called()
+        self.assertEqual(app.qcs_controller.latency_ps, 2**53 + 1)
 
     def test_entered_live_gain_is_used_and_retained(self):
         app = self.app('0.45')

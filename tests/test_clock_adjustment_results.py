@@ -29,7 +29,8 @@ class ClockAdjustmentResultTests(unittest.TestCase):
         controller = RealtimeG2Controller(SimpleNamespace(time_tagger_setting_channels=(1, 2)),
                                           {'live_correction_gain': 0.3})
         controller.remote = remote
-        controller.live_state = {}
+        controller.live_state = {'tau_ps': 0., 'T_lastmid_ps': 0.}
+        controller.live_state_rt = {}
         controller.live_t10_ps = controller.live_t20_ps = 0
         controller.initial_clock_adjustment_applied = True
         controller.live_discard_through_sequence = 0
@@ -40,8 +41,8 @@ class ClockAdjustmentResultTests(unittest.TestCase):
         return controller
 
     def arrays(self):
-        return {'ttx': (np.array([10, 20, 30, 40]), np.array([1, 2, 1, 2])),
-                'hh': (np.array([10, 30]), np.array([6, 6]))}
+        return {'ttx_live': (np.array([10, 30]), np.array([20, 40])),
+                'hh_live': np.array([10, 30])}
 
     def test_coordinator_extracts_zero_delta_and_remote_message(self):
         remote = self.coordinator()
@@ -87,21 +88,31 @@ class ClockAdjustmentResultTests(unittest.TestCase):
         remote.set_clock_correction = send
         original_publish = controller._publish
         published_status = []
+        queued_next = False
 
         def publish():
+            nonlocal queued_next
             original_publish()
             step = controller.live_step_result
             if step is not None:
                 published_status.append(step['clock_status'])
-            if step is not None and step['clock_status'] == 'unchanged (below resolution)':
+            if (not queued_next and step is not None
+                    and step['clock_status'] == 'unchanged (below resolution)'):
+                queued_next = True
                 self.assertIsNone(controller.integrity_failure)
                 self.assertEqual(controller.qcs_clock_adjustment_total_ps_per_s, 100.0)
                 # Exercise the actual acquisition gate after the no-change reply.
+                storage = controller._acquire_channel_buffer_locked()
+                for key, tags in ((('ttx', 1), [10, 30]), (('ttx', 2), [20, 40]),
+                                  (('hh', 6), [10, 30])):
+                    storage['data'][key][:len(tags)] = tags
+                    storage['sizes'][key] = len(tags)
                 controller._handle_completed_interval({
                     'sequence': 3, 'initialization': False,
                     'finished_monotonic_ns': 3_000_000_000,
                     'order_errors': [], 'drops': {'ttx': 0, 'hh': 0},
-                    'buffers': {src: deque([data]) for src, data in self.arrays().items()},
+                    'buffers': {src: deque() for src in ('ttx', 'hh')},
+                    'channel_buffer': storage,
                 })
 
         controller._publish = publish
@@ -114,7 +125,7 @@ class ClockAdjustmentResultTests(unittest.TestCase):
             controller.stop_event.set()
             worker.join(timeout=1)
             self.fail('Tracking did not continue to the next interval')
-        self.assertEqual(controller._analyze_live_interval.call_count, 3)
+        self.assertEqual(controller._analyze_live_interval.call_count, 6)  # Non-RT and RT per interval.
         self.assertEqual(len(sent), 2)  # The first fit remains measurement-only.
         self.assertAlmostEqual(sent[0], -0.07648383400433602)
         self.assertAlmostEqual(sent[1], -9.0)
@@ -136,8 +147,7 @@ class ClockAdjustmentResultTests(unittest.TestCase):
             return 'initial'
 
         remote.set_clock_correction = send
-        arrays = {'ttx': (np.array([10, 20]), np.array([1, 1])),
-                  'hh': (np.array([10, 20]), np.array([6, 6]))}
+        arrays = {'ttx_init': np.array([10, 20]), 'hh_init': np.array([10, 20])}
         with patch('qcs_analyzer.global_freq_analysis.global_freq_alignment_g2', return_value={
                 'unique_best_candidate': True, 'skew_ps_per_s': 0.05,
                 'residual_offset_ps': 0.0}):

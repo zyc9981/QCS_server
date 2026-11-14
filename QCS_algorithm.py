@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any, Mapping
 from numba import njit
 from qcs_analyzer._implementation import *
+from qcs_analyzer.timestamp_math import (
+    int64_timestamps, integer_scalar, integer_resolution_ps, milliseconds_to_picoseconds,
+    midpoint_elapsed_picoseconds, shift_picoseconds,
+)
 
 import numpy as np
 
@@ -19,7 +23,7 @@ DEFAULT_QCS_CONFIG = {
     'init_interval_s': 2.0,
     'acquisition_interval_s': 1.0,
 
-    'latency_ms': 550.0,
+    'latency_ms': 0.0,
     'init_time_offset_range_ms': 40.0,
     'init_bin_number': 1_000_000,
 
@@ -95,8 +99,8 @@ def g2_histogram_numba(
         - Edges are uniformly spaced.
         - Bins include their lower edge and exclude their upper edge.
     """
-    acquisition_a = np.asarray(acquisition_a)
-    acquisition_b = np.asarray(acquisition_b)
+    acquisition_a = int64_timestamps(acquisition_a, 'acquisition_a')
+    acquisition_b = int64_timestamps(acquisition_b, 'acquisition_b')
     edges = np.asarray(edges, dtype=np.float64)
 
     if acquisition_a.ndim != 1 or acquisition_b.ndim != 1:
@@ -104,6 +108,12 @@ def g2_histogram_numba(
 
     if edges.ndim != 1 or len(edges) < 2:
         raise ValueError("edges must contain at least two boundaries.")
+
+    # Sorted input extrema bound every subtraction performed by the kernel.
+    if acquisition_a.size and acquisition_b.size:
+        if (int(acquisition_b[-1]) - int(acquisition_a[0]) > np.iinfo(np.int64).max
+                or int(acquisition_b[0]) - int(acquisition_a[-1]) < np.iinfo(np.int64).min):
+            raise OverflowError('Histogram timestamp differences exceed the int64 range')
 
     widths = np.diff(edges)
     time_bin_ps = widths[0]
@@ -192,9 +202,9 @@ class RealtimeG2Controller:
             'init_interval_s', DEFAULT_QCS_CONFIG['init_interval_s']))
         if not np.isfinite(self.init_interval_s) or self.init_interval_s <= 0:
             raise ValueError('Init_interval must be a positive finite number of seconds')
-        self.latency_ms = float(self.config.get('latency_ms', DEFAULT_QCS_CONFIG['latency_ms']))
-        if not np.isfinite(self.latency_ms) or self.latency_ms < 0:
-            raise ValueError('latency_ms must be a nonnegative finite number')
+        latency_value = self.config.get('latency_ms', DEFAULT_QCS_CONFIG['latency_ms'])
+        self.latency_ps = milliseconds_to_picoseconds(latency_value)
+        self.latency_ms = float(latency_value)
         self.live_clock_adjustment_enabled = (
             self.config.get('live_clock_adjustment_enabled', True) is True
         )
@@ -285,6 +295,26 @@ class RealtimeG2Controller:
             int(self.config.get('live_ch_2', 2)),
         )
         self.live_hh_channel_1 = int(self.config.get('live_ch_1', 6))
+        self.channel_buffer_channels = {
+            'ttx': tuple(dict.fromkeys((*self.live_ttx_channels,
+                int(self.config.get('init_ttx_photon_channel', 1))))),
+            'hh': tuple(dict.fromkeys((self.live_hh_channel_1,
+                int(self.config.get('init_hh_photon_channel',
+                    int(self.config.get('hydraharp_channel_offset', 5)) + 1))))),
+        }
+        self.channel_buffer_capacities = {
+            (source, channel): self.max_events[source]
+            for source, channels in self.channel_buffer_channels.items()
+            for channel in channels
+        }
+        self.channel_buffer_capacities[('ttx', self.live_ttx_channels[1])] = min(
+            self.max_events['ttx'], int(self.config.get('max_events_ttx_ch2', 1_000_000)))
+        if any(limit <= 0 for limit in self.channel_buffer_capacities.values()):
+            raise ValueError('Per-channel buffer capacities must be positive')
+        # One active interval, one in analysis and up to two queued intervals.
+        self.free_channel_buffers = []
+        self.allocated_channel_buffers = 0
+        self.channel_buffer = self._acquire_channel_buffer_locked()
         self.counts = dict(ttx=0, hh=0)
         self.total = dict(ttx=0, hh=0)
         self.ttx_channel_totals = {}
@@ -364,8 +394,9 @@ class RealtimeG2Controller:
         resolution = self.config.get('hydraharp_base_resolution_ps')
         if resolution is None:
             resolution = metadata.get('source', {}).get('base_resolution_ps')
-        if resolution is None or not np.isfinite(float(resolution)) or float(resolution) <= 0 or not float(resolution).is_integer():
+        if resolution is None:
             raise ValueError('Remote HydraHarp must report a positive integer base_resolution_ps')
+        resolution = integer_resolution_ps(resolution)
         with self.lock:
             if self.stop_event.is_set():
                 raise RuntimeError('QCS startup cancelled')
@@ -373,6 +404,26 @@ class RealtimeG2Controller:
             self.next_interval_end = time.monotonic() + self.init_interval_s
             self.session_started_monotonic = self.next_interval_end - self.init_interval_s
             self.status = f'Initializing: acquiring {self.init_interval_s:g} s into memory'
+
+    def _acquire_channel_buffer_locked(self):
+        """Acquire exclusive writable storage; callers hold the acquisition lock."""
+        if self.free_channel_buffers:
+            buffer = self.free_channel_buffers.pop()
+            buffer['sizes'] = dict.fromkeys(buffer['data'], 0)
+            return buffer
+        if self.allocated_channel_buffers >= 4:
+            raise RuntimeError('QCS analysis fell behind; no free interval buffer is available')
+        data = {key: np.empty(capacity, dtype=np.int64)
+                for key, capacity in self.channel_buffer_capacities.items()}
+        self.allocated_channel_buffers += 1
+        return {'data': data, 'sizes': dict.fromkeys(data, 0)}
+
+    def _release_channel_buffer(self, arrays):
+        """Return storage only after all analysis of its views has finished."""
+        buffer = arrays.pop('_channel_buffer', None)
+        if buffer is not None:
+            with self.lock:
+                self.free_channel_buffers.append(buffer)
 
     def _append(self, source, times, channels):
         times, channels = np.asarray(times), np.asarray(channels)
@@ -382,7 +433,7 @@ class RealtimeG2Controller:
             return
         if not np.issubdtype(times.dtype, np.integer) or not np.issubdtype(channels.dtype, np.integer):
             raise ValueError('Timestamp and channel arrays must contain integers')
-        times = times.astype(np.int64, copy=True)
+        times = int64_timestamps(times).copy()
         channels = channels.astype(np.int64, copy=True)
         with self.lock:
             if self.stop_event.is_set():
@@ -393,20 +444,26 @@ class RealtimeG2Controller:
             if previous is not None and times[0] < previous:
                 self.interval_order_errors.append(f'{source}: timestamps moved backwards between batches')
             self.last_timestamp[source] = int(times[-1])
-            if source == 'ttx':
-                ch_0, ch_2 = self.live_ttx_channels
-                t_0_batch = times[channels == ch_0].copy()
-                t_2_batch = times[channels == ch_2].copy()
-                # Rebase live-only channel buffers as data arrives once the
-                # initialization alignment has established the TTX origin.
-                # Preserve raw timestamps for quality checks and alignment.
-                if self.live_t10_ps is not None:
-                    ttx_origin_ps = np.int64(self.live_t10_ps)
-                    t_0_batch -= ttx_origin_ps
-                    t_2_batch -= ttx_origin_ps
-                self.buffers[source].append((times, channels, t_0_batch, t_2_batch))
-            else:
-                self.buffers[source].append((times, channels))
+            if self.counts[source] + len(times) > self.max_events[source]:
+                self.integrity_failure = f'{source}: preallocated interval event capacity exceeded'
+                raise RuntimeError(self.integrity_failure)
+            origin = self.live_t10_ps if source == 'ttx' else self.live_t20_ps
+            origin_ps = int(origin) if origin is not None else 0
+            for channel in self.channel_buffer_channels[source]:
+                selected = times[channels == channel]
+                key = (source, channel)
+                start = self.channel_buffer['sizes'][key]
+                end = start + len(selected)
+                if end > len(self.channel_buffer['data'][key]):
+                    self.integrity_failure = (
+                        f'{source} ch{channel}: preallocated channel event capacity exceeded')
+                    raise RuntimeError(self.integrity_failure)
+                shift_picoseconds(selected, -origin_ps,
+                                  out=self.channel_buffer['data'][key][start:end])
+                self.channel_buffer['sizes'][key] = end
+            # Raw chunks support on-demand snapshots; analysis uses only the
+            # channel buffers filled above, never a final concatenation.
+            self.buffers[source].append((times, channels))
             self.counts[source] += len(times)
             self.total[source] += len(times)
             if source == 'ttx':
@@ -416,23 +473,6 @@ class RealtimeG2Controller:
                     self.ttx_channel_totals[channel] = (
                         self.ttx_channel_totals.get(channel, 0) + int(count)
                     )
-            excess = self.counts[source] - self.max_events[source]
-            while excess > 0:
-                chunk = self.buffers[source].popleft()
-                t, ch = chunk[:2]
-                removed = min(excess, len(t))
-                if removed < len(t):
-                    remainder = (t[removed:].copy(), ch[removed:].copy())
-                    if source == 'ttx':
-                        ch_0, ch_2 = self.live_ttx_channels
-                        n_ch_0 = int(np.count_nonzero(ch[:removed] == ch_0))
-                        n_ch_2 = int(np.count_nonzero(ch[:removed] == ch_2))
-                        remainder += (chunk[2][n_ch_0:].copy(), chunk[3][n_ch_2:].copy())
-                    self.buffers[source].appendleft(remainder)
-                self.counts[source] -= removed
-                self.evicted[source] += removed
-                self.interval_evicted[source] += removed
-                excess -= removed
         if completed is not None:
             self._handle_completed_interval(completed)
 
@@ -445,6 +485,9 @@ class RealtimeG2Controller:
         if self.next_interval_end is None or now < self.next_interval_end:
             return None
         elapsed = int((now - self.next_interval_end) // self.acquisition_interval_s) + 1
+        next_channel_buffer = self._acquire_channel_buffer_locked()
+        completed_channel_buffer = self.channel_buffer
+        self.channel_buffer = next_channel_buffer
         completed = self.buffers
         if self.completed_intervals == 0:
             self.status = f'Acquiring in {self.acquisition_interval_s:g} s memory intervals'
@@ -454,7 +497,8 @@ class RealtimeG2Controller:
             self.counts[source] = 0
         self.completed_intervals += elapsed
         self.next_interval_end += elapsed * self.acquisition_interval_s
-        interval = dict(buffers=completed, sequence=self.completed_intervals,
+        interval = dict(buffers=completed, channel_buffer=completed_channel_buffer,
+                        sequence=self.completed_intervals,
                         initialization=self.completed_intervals == elapsed,
                         finished_monotonic_ns=(int(now_ns) if now_ns is not None
                                                else time.monotonic_ns()),
@@ -482,48 +526,34 @@ class RealtimeG2Controller:
         insufficient = []
         arrays = {}
 
+        buffer = completed['channel_buffer']
+        arrays['_channel_buffer'] = buffer
+        handed_off = False
         try:
-            # Concatenate
-            t0 = time.time()
-            for source, chunks in completed['buffers'].items():
-                if source != 'ttx':
-                    times = np.concatenate([item[0] for item in chunks]) if chunks else np.empty(0, dtype=np.int64)
-                    channels = np.concatenate([item[1] for item in chunks]) if chunks else np.empty(0, dtype=np.int64)
-                    arrays[source] = (times, channels)
+            # Filled slices are views of storage owned by this interval.
+            # Acquisition has already switched to a different buffer set.
+            def channel_view(source, channel):
+                key = (source, channel)
+                view = buffer['data'][key][:buffer['sizes'][key]].view()
+                view.flags.writeable = False
+                return view
+
+            arrays['ttx_live'] = tuple(channel_view('ttx', ch)
+                                       for ch in self.live_ttx_channels)
+            arrays['hh_live'] = channel_view('hh', self.live_hh_channel_1)
+            if completed['initialization']:
+                arrays['ttx_init'] = channel_view(
+                    'ttx', int(self.config.get('init_ttx_photon_channel', 1)))
+                arrays['hh_init'] = channel_view(
+                    'hh', int(self.config.get('init_hh_photon_channel', offset + 1)))
+            for source in ('ttx', 'hh'):
                 # Temporary workaround: assume interval timestamp quality is good.
-                # TTX raw arrays are no longer assembled here; validate its
-                # chunks individually when re-enabling validation.
+                # Validate chunks at ingestion if this check is restored; raw
+                # interval arrays are no longer assembled.
                 # check = check_timestamp_quality(times, channels, allowed_channels=allowed[source],
                 #                                 required_channels=required[source], min_events_per_channel=minimum)
                 check = {'errors': [], 'insufficient': [], 'counts': {}}
                 source_checks[source] = check
-                reasons.extend(f'{source}: {reason}' for reason in check['errors'])
-                insufficient.extend(f'{source}: {reason}' for reason in check['insufficient'])
-            print("Concatenate1: ", time.time() - t0)
-
-            t0 = time.time()
-            ttx_chunks = completed['buffers']['ttx']
-            arrays['ttx_live'] = (
-                np.concatenate([item[2] for item in ttx_chunks if len(item) > 2])
-                if ttx_chunks and len(ttx_chunks[0]) > 2 else np.empty(0, dtype=np.int64),
-                np.concatenate([item[3] for item in ttx_chunks if len(item) > 3])
-                if ttx_chunks and len(ttx_chunks[0]) > 3 else np.empty(0, dtype=np.int64),
-            )
-            if completed['initialization']:
-                photon1 = int(self.config.get('init_ttx_photon_channel', 1))
-                if photon1 in self.live_ttx_channels:
-                    # Before alignment these separated arrays still contain
-                    # raw device timestamps, preserving the original origin.
-                    arrays['ttx_init'] = arrays['ttx_live'][
-                        self.live_ttx_channels.index(photon1)]
-                else:
-                    # Support a different initialization channel by selecting
-                    # it within each chunk before concatenating its tags.
-                    arrays['ttx_init'] = (
-                        np.concatenate([item[0][item[1] == photon1] for item in ttx_chunks])
-                        if ttx_chunks else np.empty(0, dtype=np.int64)
-                    )
-            print("Concatenate2: ", time.time() - t0)
             status = 'data loss' if any(drops.values()) else ('invalid timestamps' if reasons else
                      ('insufficient data' if insufficient else 'checks passed'))
             report = dict(sequence=completed['sequence'], status=status,
@@ -542,6 +572,7 @@ class RealtimeG2Controller:
                         target=self._initialize_alignment, args=(arrays,),
                         name='qcs-initial-alignment', daemon=True)
                     self.initialization_worker.start()
+                    handed_off = True
                 else:
                     self.initialization_status = 'Initialization failed: ' + status + '; ' + '; '.join(report['reasons'])
             elif not completed['initialization']:
@@ -559,12 +590,22 @@ class RealtimeG2Controller:
                     )
                     if status == 'checks passed' and not self.integrity_failure and not self.stop_event.is_set():
                         try:
-                            self.live_interval_queue.put_nowait((completed['sequence'], arrays))
+                            with self.lock:
+                                if not self.stop_event.is_set():
+                                    self.live_interval_queue.put_nowait((completed['sequence'], arrays))
+                                    handed_off = True
                         except queue.Full:
                             self._record_integrity_failure(
                                 'Live analysis fell behind; a completed interval could not be queued')
         finally:
             completed['buffers'].clear()
+            if not handed_off:
+                self._release_channel_buffer(arrays)
+
+    def set_live_clock_adjustment_enabled(self, enabled):
+        """Change future live commands; commands already sent finish normally."""
+        with self.lock:
+            self.live_clock_adjustment_enabled = bool(enabled)
 
     def _send_clock_adjustment(self, correction_ps_per_s):
         """Send a correction through the shared remote command path."""
@@ -681,13 +722,14 @@ class RealtimeG2Controller:
 
         # The primary fit determines clock correction. Update that state and
         # let the caller queue the command before running auxiliary tracking.
-        T_mid_ps = (t1_ps[0] + t1_ps[-1]) / 2
-        elapsed_mid_ps = T_mid_ps - state["T_lastmid_ps"]
-        if elapsed_mid_ps <= 0:
-            raise ValueError("Live interval midpoint did not advance")
+        midpoint_twice_ps, elapsed_mid_ps = midpoint_elapsed_picoseconds(
+            t1_ps[0], t1_ps[-1], state)
         state["u0"] = (fit["center"] - state["tau_ps"]) / elapsed_mid_ps
         state["tau_ps"] = fit["center"]
-        state["T_lastmid_ps"] = T_mid_ps
+        state["T_lastmid_twice_ps"] = midpoint_twice_ps
+        # Display/log compatibility only; the next skew calculation uses the
+        # exact doubled midpoint above, including its half-picosecond bit.
+        state["T_lastmid_ps"] = midpoint_twice_ps / 2.0
 
         # Update on tau_span
         if abs(state["u0"]) < 200e-12:
@@ -731,10 +773,11 @@ class RealtimeG2Controller:
                     print(f'QCS live tracking log: {self.live_log_path}', flush=True)
 
                 relative_ns = int(event_monotonic_ns) - self.live_log_origin_ns
+                seconds, nanoseconds = divmod(abs(relative_ns), 1_000_000_000)
                 row = {
                     'event': event,
                     'interval': int(sequence),
-                    'relative_s': f'{relative_ns * 1e-9:.9f}',
+                    'relative_s': f'{"-" if relative_ns < 0 else ""}{seconds}.{nanoseconds:09d}',
                 }
                 row.update(values)
                 with self.live_log_path.open('a', newline='', encoding='utf-8') as file:
@@ -766,27 +809,23 @@ class RealtimeG2Controller:
                 continue
             try:
                 if item is None:
-                    return
+                    break
 
                 sequence, arrays = item
-                hh_times_ps, hh_channels = arrays['hh']
                 ttx_ch1_ps, ttx_ch2_ps = arrays['ttx_live']
                 if (self.live_state is None or self.live_state_rt is None
                         or self.live_t10_ps is None or self.live_t20_ps is None):
                     raise RuntimeError('Live tracking state was not initialized after alignment')
                 # Non-RT is TTX ch1 against remote HH ch6. Both inputs are
                 # integer picoseconds rebased to their calibrated origins.
-                hh_ch6_ps = (
-                    hh_times_ps[hh_channels == self.live_hh_channel_1]
-                    - np.int64(self.live_t20_ps)
-                )
+                hh_ch6_ps = arrays['hh_live']
                 first_live_step = self.live_analysis_steps == 0
-                nonrt_started_ns = time.monotonic_ns()
-                self._log_live_tracking_event(
-                    'non_rt_processing_started', sequence, nonrt_started_ns,
-                    tau_ps=self.live_state['tau_ps'],
-                    T_lastmid_ms=self.live_state['T_lastmid_ps'] * 1e-9,
-                )
+                # nonrt_started_ns = time.monotonic_ns()
+                # self._log_live_tracking_event(
+                #     'non_rt_processing_started', sequence, nonrt_started_ns,
+                #     tau_ps=self.live_state['tau_ps'],
+                #     T_lastmid_ms=self.live_state['T_lastmid_ps'] * 1e-9,
+                # )
                 nonrt_state = self._analyze_live_interval(
                     sequence, ttx_ch1_ps, hh_ch6_ps, state=self.live_state)
                 nonrt_finished_ns = time.monotonic_ns()
@@ -803,6 +842,7 @@ class RealtimeG2Controller:
                     nonrt_state['T_lastmid_ps'] * 1e-12, nonrt_state['tau_ps'])
                 self.live_analysis_steps += 1
                 with self.lock:
+                    live_clock_adjustment_enabled = self.live_clock_adjustment_enabled
                     self.live_step_result = {
                         'sequence': int(sequence),
                         'tau_ps': float(nonrt_state['tau_ps']),
@@ -821,7 +861,7 @@ class RealtimeG2Controller:
                         T_lastmid_ms=nonrt_state['T_lastmid_ps'] * 1e-9,
                         clock_status='first live fit is measurement-only',
                     )
-                elif not self.live_clock_adjustment_enabled:
+                elif not live_clock_adjustment_enabled:
                     with self.lock:
                         self.live_step_result['clock_status'] = 'disabled'
                     self._publish()
@@ -834,7 +874,7 @@ class RealtimeG2Controller:
                     )
 
                 clock_error = None
-                if not first_live_step and self.live_clock_adjustment_enabled:
+                if not first_live_step and live_clock_adjustment_enabled:
                     # The node applies signed increments; send the opposite
                     # of the measured non-RT residual drift.
                     correction_ps_per_s = -self.live_correction_gain * residual_drift_ps_per_s
@@ -930,27 +970,40 @@ class RealtimeG2Controller:
                 self._record_integrity_failure(message)
                 self._publish()
             finally:
+                if item is not None:
+                    self._release_channel_buffer(item[1])
                 self.live_interval_queue.task_done()
+        # Stopping can leave completed intervals queued but never analyzed.
+        pending_intervals = []
+        with self.lock:
+            while True:
+                try:
+                    pending_intervals.append(self.live_interval_queue.get_nowait())
+                except queue.Empty:
+                    break
+        for pending in pending_intervals:
+            if pending is not None:
+                self._release_channel_buffer(pending[1])
+            self.live_interval_queue.task_done()
 
     def _initialize_alignment(self, arrays):
         """Find global alignment, command the correction, and await its result."""
         try:
             from qcs_analyzer.global_freq_analysis import global_freq_alignment_g2
             t1_ps = arrays['ttx_init']
-            t2_ps, ch2 = arrays['hh']
+            t2_ps = arrays['hh_init']
             # Hardware timestamps are integer picoseconds. Keep them integer
             # through the Unix-start/latency correction; converting large
             # timestamps to float before rebasing can discard low bits.
             if not np.issubdtype(t1_ps.dtype, np.integer) or not np.issubdtype(t2_ps.dtype, np.integer):
                 raise TypeError('TTX and HydraHarp timestamps must be integer picoseconds')
-            t1_ps = np.asarray(t1_ps, dtype=np.int64)
-            t2_ps = np.asarray(t2_ps, dtype=np.int64)
-            ch2 = np.asarray(ch2, dtype=np.int64)
+            t1_ps = int64_timestamps(t1_ps, 'initial TTX timestamps')
+            t2_ps = int64_timestamps(t2_ps, 'initial HH timestamps')
             offset = int(self.config.get('hydraharp_channel_offset', 5))
             photon1 = int(self.config.get('init_ttx_photon_channel', 1))
             photon2 = int(self.config.get('init_hh_photon_channel', offset + 1))
             first = t1_ps
-            second = t2_ps[ch2 == photon2]
+            second = t2_ps
             if first.size < 2 or second.size < 2:
                 raise ValueError(f'Need at least two photon events on channels {photon1}/{photon2}')
             origins = (int(first[0]), int(second[0]))
@@ -958,13 +1011,12 @@ class RealtimeG2Controller:
             remote_start = self.remote.snapshot().get('remote_start_time_us')
             if t01_us is None or remote_start is None:
                 raise RuntimeError('TTX and HH Unix start timestamps are required for global alignment')
-            t02_us = int(remote_start)
-            latency_ps = int(round(self.latency_ms * 1_000_000_000))
-            offset_ps = (t02_us - int(t01_us)) * 1_000_000 - latency_ps
-            first = (first - np.int64(origins[0])).astype(np.int64, copy=False)
-            second = (second - np.int64(origins[1]) + np.int64(offset_ps)).astype(
-                np.int64, copy=False
-            )
+            t01_us = integer_scalar(t01_us, 'TTX Unix start time in us')
+            t02_us = integer_scalar(remote_start, 'HH Unix start time in us')
+            latency_ps = self.latency_ps
+            offset_ps = (t02_us - t01_us) * 1_000_000 - latency_ps
+            first = shift_picoseconds(first, -origins[0])
+            second = shift_picoseconds(second, offset_ps - origins[1])
             options = dict(self.config.get('global_alignment_kwargs', {}))
             # Matplotlib/Tk figures must be created by the GUI thread. The UI
             # plots the completed result after this worker returns.
@@ -1059,6 +1111,7 @@ class RealtimeG2Controller:
             with self.lock:
                 self.initialization_status = 'Initialization failed: ' + str(exc)
         finally:
+            self._release_channel_buffer(arrays)
             arrays.clear()
             self._publish()
 
@@ -1077,7 +1130,7 @@ class RealtimeG2Controller:
 
     def _read_ttx(self, reader):
         data = reader.getData()
-        times = np.asarray(data.getTimestamps(), dtype=np.int64)
+        times = int64_timestamps(data.getTimestamps(), 'TTX SDK timestamps')
         if len(times) >= self.max_events['ttx'] or data.hasOverflows:
             self._record_integrity_failure('Time Tagger X overflow or full SDK buffer')
             raise RuntimeError('Time Tagger X buffer overflow; QCS data are incomplete')

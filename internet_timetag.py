@@ -131,6 +131,7 @@ class InternetCoordinator:
                         and command['status'] in ('queued', 'sent')):
                     command['status'] = status
                     command['message'] = message
+                    command['result_monotonic_ns'] = time.monotonic_ns()
                     event = self.clock_command_events.get(command['command_id'])
                     if event is not None:
                         event.set()
@@ -143,6 +144,7 @@ class InternetCoordinator:
                         and now - command['sent_monotonic'] >= self.timeout):
                     command['status'] = 'timed_out'
                     command['message'] = 'No CLOCK_RESULT received before the control timeout'
+                    command['result_monotonic_ns'] = time.monotonic_ns()
                     event = self.clock_command_events.get(command['command_id'])
                     if event is not None:
                         event.set()
@@ -425,6 +427,7 @@ class InternetCoordinator:
                             if command is not None:
                                 command['status'] = 'applied' if msg.get('success') is True else 'failed'
                                 command['result'] = msg
+                                command['result_monotonic_ns'] = time.monotonic_ns()
                                 command.pop('message', None)
                                 event = self.clock_command_events.get(command_id)
                                 if event is not None:

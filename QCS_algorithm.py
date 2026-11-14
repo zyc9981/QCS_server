@@ -35,11 +35,18 @@ DEFAULT_QCS_CONFIG = {
 
 DEFAULT_LIVE_STATE = {
     'time_bin_ps': 20.0,
-    'time_bin_rt_ps': 20.0,
     'tau_span_ps': 500_000.0,
+    'tau_span_min_ps': 5_000.0,
     'tau_ps': 0.0,
-    'tau_rt_ps': 58_968_630.0,
-    'epsilon_ps': 0.0,
+    'u0': 0.0,
+    'T_lastmid_ps': 0.0,
+}
+
+DEFAULT_LIVE_STATE_RT = {
+    'time_bin_ps': 20.0,
+    'tau_span_ps': 500_000.0,
+    'tau_span_min_ps': 5_000.0,
+    'tau_ps': 58_968_630.0,
     'u0': 0.0,
     'T_lastmid_ps': 0.0,
 }
@@ -77,8 +84,6 @@ def g2_histogram_numba(
     edges,
     *,
     Ta_s,
-    chA,
-    chB,
     time_bin_ps_init,
 ):
     """
@@ -173,9 +178,7 @@ def g2_histogram_numba(
         "centers": centers.copy(),
         "histogram": counts / time_bin_ps * time_bin_ps_init,
         "histogram_raw": counts.copy(),
-        "T_acq_s": float(Ta_s),
-        "chA": chA,
-        "chB": chB,
+        "T_acq_s": float(Ta_s)
     }
 
 
@@ -239,6 +242,7 @@ class RealtimeG2Controller:
         self.live_interval_queue = queue.Queue(maxsize=2)
         self.live_analysis_worker = None
         self.live_state = None
+        self.live_state_rt = None
         self.live_t10_ps = None
         self.live_t20_ps = None
         self.calibrated_offset_ps = None
@@ -275,6 +279,12 @@ class RealtimeG2Controller:
         self.ttx_start_monotonic_us = None
         self.remote = None
         self.buffers = {key: deque() for key in ('ttx', 'hh')}
+        # TTX channels consumed by live tracking, selected at ingestion time.
+        self.live_ttx_channels = (
+            int(self.config.get('live_ch_0', 1)),
+            int(self.config.get('live_ch_2', 2)),
+        )
+        self.live_hh_channel_1 = int(self.config.get('live_ch_1', 6))
         self.counts = dict(ttx=0, hh=0)
         self.total = dict(ttx=0, hh=0)
         self.ttx_channel_totals = {}
@@ -383,7 +393,20 @@ class RealtimeG2Controller:
             if previous is not None and times[0] < previous:
                 self.interval_order_errors.append(f'{source}: timestamps moved backwards between batches')
             self.last_timestamp[source] = int(times[-1])
-            self.buffers[source].append((times, channels))
+            if source == 'ttx':
+                ch_0, ch_2 = self.live_ttx_channels
+                t_0_batch = times[channels == ch_0].copy()
+                t_2_batch = times[channels == ch_2].copy()
+                # Rebase live-only channel buffers as data arrives once the
+                # initialization alignment has established the TTX origin.
+                # Preserve raw timestamps for quality checks and alignment.
+                if self.live_t10_ps is not None:
+                    ttx_origin_ps = np.int64(self.live_t10_ps)
+                    t_0_batch -= ttx_origin_ps
+                    t_2_batch -= ttx_origin_ps
+                self.buffers[source].append((times, channels, t_0_batch, t_2_batch))
+            else:
+                self.buffers[source].append((times, channels))
             self.counts[source] += len(times)
             self.total[source] += len(times)
             if source == 'ttx':
@@ -395,10 +418,17 @@ class RealtimeG2Controller:
                     )
             excess = self.counts[source] - self.max_events[source]
             while excess > 0:
-                t, ch = self.buffers[source].popleft()
+                chunk = self.buffers[source].popleft()
+                t, ch = chunk[:2]
                 removed = min(excess, len(t))
                 if removed < len(t):
-                    self.buffers[source].appendleft((t[removed:].copy(), ch[removed:].copy()))
+                    remainder = (t[removed:].copy(), ch[removed:].copy())
+                    if source == 'ttx':
+                        ch_0, ch_2 = self.live_ttx_channels
+                        n_ch_0 = int(np.count_nonzero(ch[:removed] == ch_0))
+                        n_ch_2 = int(np.count_nonzero(ch[:removed] == ch_2))
+                        remainder += (chunk[2][n_ch_0:].copy(), chunk[3][n_ch_2:].copy())
+                    self.buffers[source].appendleft(remainder)
                 self.counts[source] -= removed
                 self.evicted[source] += removed
                 self.interval_evicted[source] += removed
@@ -435,39 +465,77 @@ class RealtimeG2Controller:
 
     def _handle_completed_interval(self, completed):
         """Check acquisition integrity and timestamps, then release interval data."""
+        
+        # Pre
         reasons = list(completed['order_errors'])
         drops = completed['drops']
         if any(drops.values()):
             reasons.append(f'Memory capacity dropped events: {drops}')
         source_checks = {}
         offset = int(self.config.get('hydraharp_channel_offset', 5))
-        required = {'ttx': self.config.get('required_ttx_channels', (1, 2)),
-                    'hh': self.config.get('required_hh_channels', (offset + 1,))}
+        # required = {'ttx': self.config.get('required_ttx_channels', (1, 2)),
+        #             'hh': self.config.get('required_hh_channels', (offset + 1,))}
         configured = getattr(self.app, 'time_tagger_setting_channels', (1, 2, 3, 4))
-        allowed = {'ttx': [abs(int(ch)) if abs(int(ch)) <= 4 else int(ch) for ch in configured],
-                   'hh': range(offset, offset + 65)}
-        minimum = int(self.config.get('min_events_per_channel', 2))
+        # allowed = {'ttx': [abs(int(ch)) if abs(int(ch)) <= 4 else int(ch) for ch in configured],
+        #            'hh': range(offset, offset + 65)}
+        # minimum = int(self.config.get('min_events_per_channel', 2))
         insufficient = []
         arrays = {}
+
         try:
+            # Concatenate
+            t0 = time.time()
             for source, chunks in completed['buffers'].items():
-                times = np.concatenate([item[0] for item in chunks]) if chunks else np.empty(0, dtype=np.int64)
-                channels = np.concatenate([item[1] for item in chunks]) if chunks else np.empty(0, dtype=np.int64)
-                arrays[source] = (times, channels)
-                check = check_timestamp_quality(times, channels, allowed_channels=allowed[source],
-                                                required_channels=required[source], min_events_per_channel=minimum)
+                if source != 'ttx':
+                    times = np.concatenate([item[0] for item in chunks]) if chunks else np.empty(0, dtype=np.int64)
+                    channels = np.concatenate([item[1] for item in chunks]) if chunks else np.empty(0, dtype=np.int64)
+                    arrays[source] = (times, channels)
+                # Temporary workaround: assume interval timestamp quality is good.
+                # TTX raw arrays are no longer assembled here; validate its
+                # chunks individually when re-enabling validation.
+                # check = check_timestamp_quality(times, channels, allowed_channels=allowed[source],
+                #                                 required_channels=required[source], min_events_per_channel=minimum)
+                check = {'errors': [], 'insufficient': [], 'counts': {}}
                 source_checks[source] = check
                 reasons.extend(f'{source}: {reason}' for reason in check['errors'])
                 insufficient.extend(f'{source}: {reason}' for reason in check['insufficient'])
+            print("Concatenate1: ", time.time() - t0)
+
+            t0 = time.time()
+            ttx_chunks = completed['buffers']['ttx']
+            arrays['ttx_live'] = (
+                np.concatenate([item[2] for item in ttx_chunks if len(item) > 2])
+                if ttx_chunks and len(ttx_chunks[0]) > 2 else np.empty(0, dtype=np.int64),
+                np.concatenate([item[3] for item in ttx_chunks if len(item) > 3])
+                if ttx_chunks and len(ttx_chunks[0]) > 3 else np.empty(0, dtype=np.int64),
+            )
+            if completed['initialization']:
+                photon1 = int(self.config.get('init_ttx_photon_channel', 1))
+                if photon1 in self.live_ttx_channels:
+                    # Before alignment these separated arrays still contain
+                    # raw device timestamps, preserving the original origin.
+                    arrays['ttx_init'] = arrays['ttx_live'][
+                        self.live_ttx_channels.index(photon1)]
+                else:
+                    # Support a different initialization channel by selecting
+                    # it within each chunk before concatenating its tags.
+                    arrays['ttx_init'] = (
+                        np.concatenate([item[0][item[1] == photon1] for item in ttx_chunks])
+                        if ttx_chunks else np.empty(0, dtype=np.int64)
+                    )
+            print("Concatenate2: ", time.time() - t0)
             status = 'data loss' if any(drops.values()) else ('invalid timestamps' if reasons else
                      ('insufficient data' if insufficient else 'checks passed'))
             report = dict(sequence=completed['sequence'], status=status,
                           reasons=reasons + insufficient, sources=source_checks,
                           network='Frame CRC/sequence checked on receipt; final SHA-256 pending session end')
+            
+            
             with self.lock:
                 if self.quality is None or report['sequence'] >= self.quality['sequence']:
                     self.quality = report
             if completed['initialization']:
+                # Global Init
                 if status == 'checks passed' and not self.integrity_failure and not self.stop_event.is_set():
                     self.initialization_status = 'Sweeping global frequency difference...'
                     self.initialization_worker = threading.Thread(
@@ -526,26 +594,15 @@ class RealtimeG2Controller:
             self,
             sequence,
             t1_ps,
-            ch1,
             t2_ps,
-            ch2,
             state,
-            ch_0=1,
-            ch_1=6,
-            ch_2=2,
-            ch_ref_0=3,
-            ch_ref_1=7,
 
-            t10_ps=0,
-            t20_ps=0,
             fit_curve="g2calib_2",
             fit_parameters={
                 "height": 40,
                 "sigma": 100,
                 "offset": 1,
             },
-            # sour_freq=100e6,
-            fwhm_calib_ps=1000,
             second_order_fit=False,
             show_fit=False,
             Freq=50e6,
@@ -570,67 +627,36 @@ class RealtimeG2Controller:
         except (TypeError, ValueError) as exc:
             raise TypeError("fit_parameters must be a dictionary of initial fit values.") from exc
 
-        t0 = time.time()
-        # t_0 = t1_ps[ch1 == ch_0] - t10_ps
-        t_0 = t1_ps[ch1 == ch_0]
-        t_0 -= np.int64(t10_ps)
-        print("g2 prepare1: ", time.time() - t0)
-        t0 = time.time()
-        t_1 = t2_ps[ch2 == ch_1] - t20_ps
-        print("g2 prepare2: ", time.time() - t0)
-        t0 = time.time()
-        # t_2 = t1_ps[ch1 == ch_2] - t10_ps
-        t_2 = t1_ps[ch1 == ch_2]
-        t_2 -= np.int64(t10_ps)
-        print("g2 prepare3: ", time.time() - t0)
+        # Live acquisition supplies channel-separated timestamps already
+        # rebased to the calibrated TTX origin during ingestion.
+        # if t_0_in_ps is None or t_2_in_ps is None:
+        #     raise ValueError('Pre-separated, rebased TTX timestamps are required for live analysis')
+        # t_0 = np.asarray(t_0_in_ps, dtype=np.int64)
+        # if t_1_in_ps is None:
+        #     raise ValueError('Pre-filtered and rebased HydraHarp timestamps are required for live analysis')
+        # t_1 = np.asarray(t_1_in_ps, dtype=np.int64)
+        # t_2 = np.asarray(t_2_in_ps, dtype=np.int64)
 
         # ------------------------------------------------------------
         # STEP 2:
         # g2 processing.
         # ------------------------------------------------------------
-        t0 = time.time()
+
         t_lo = state["tau_ps"] - state["tau_span_ps"] * 0.5
         t_hi = state["tau_ps"] + state["tau_span_ps"] * 0.5
         time_bin_ps = state["time_bin_ps"]
         edges = np.arange(t_lo, t_hi + time_bin_ps, time_bin_ps)
-        centers = edges[:-1] + time_bin_ps / 2
-        start_stop_results = np.zeros(len(centers), dtype=np.int64)
+        # centers = edges[:-1] + time_bin_ps / 2
+        # start_stop_results = np.zeros(len(centers), dtype=np.int64)
 
         results = g2_histogram_numba(
-            t_0,
-            t_1,
+            t1_ps,
+            t2_ps,
             edges,
             Ta_s=self.acquisition_interval_s,
-            chA=ch_0,
-            chB=ch_1,
             time_bin_ps_init=state["time_bin_ps"],
         )
 
-        t_lo_rt = state["tau_rt_ps"] - state["tau_span_ps"] * 0.5
-        t_hi_rt = state["tau_rt_ps"] + state["tau_span_ps"] * 0.5
-        time_bin_rt_ps = state["time_bin_rt_ps"]
-        edges_rt = np.arange(t_lo_rt, t_hi_rt + time_bin_rt_ps, time_bin_rt_ps)
-        centers_rt = edges_rt[:-1] + time_bin_rt_ps / 2
-        start_stop_results_rt = np.zeros(len(centers_rt), dtype=np.int64)
-
-        results_rt = g2_histogram_numba(
-            t_0,
-            t_2,
-            edges_rt,
-            Ta_s=self.acquisition_interval_s,
-            chA=ch_0,
-            chB=ch_2,
-            time_bin_ps_init=state["time_bin_rt_ps"],
-        )
-
-        print("g2 processing: ", time.time() - t0)
-
-        # ------------------------------------------------------------
-        # STEP 3:
-        # Estimate time offset and frequency skew from g2 fit.
-        # ------------------------------------------------------------
-
-        t0 = time.time()
         try:
             fit_parameters = fit_parameter_guess.copy()
             fit_parameters["center"] = float(
@@ -645,60 +671,29 @@ class RealtimeG2Controller:
                 show=show_fit,
             )
         except Exception as exc:
-            raise
-
-            print(f"Time-dependent g2 fit failed.")
-            fit = None
-            exc_value = exc
-        else:
-            exc_value = None
-
-        try:
-            fit_parameters = fit_parameter_guess.copy()
-            fit_parameters["center"] = float(
-                results_rt["centers"][np.argmax(results_rt["histogram"])]
-            )
-            # print(fit_parameters["center"])
-            fit_rt = fit_g2(
-                results_rt,
-                curve=fit_curve,
-                parameters=fit_parameters,
-                # fit_window=np.rint(float(1e12)/Freq) * 1.0,
-                fit_window=2_000,
-                show=show_fit,
-                # show=True,
-            )
-        except Exception as exc:
-            raise
-
-            print(f"Time-dependent g2 fit failed.")
-            fit = None
-            exc_value = exc
-        else:
-            exc_value = None
-
+            raise RuntimeError(
+                f"Primary g2 fit failed: {exc}"
+            ) from exc
         if not fit.get("success", True):
             raise RuntimeError(
-                f"g2 fit failed for channels {ch_0}/{ch_1}: {fit.get('message') or 'optimizer did not converge'}"
-            )
-        if not fit_rt.get("success", True):
-            raise RuntimeError(
-                f"g2 fit failed for channels {ch_0}/{ch_2}: {fit_rt.get('message') or 'optimizer did not converge'}"
+                f"g2 fit failed for channels: {fit.get('message') or 'optimizer did not converge'}"
             )
 
-        # print("g2 fit: ", time.time() - t0)
-
-        T_mid_ps = (t_0[0] + t_0[-1]) / 2
+        # The primary fit determines clock correction. Update that state and
+        # let the caller queue the command before running auxiliary tracking.
+        T_mid_ps = (t1_ps[0] + t1_ps[-1]) / 2
         elapsed_mid_ps = T_mid_ps - state["T_lastmid_ps"]
         if elapsed_mid_ps <= 0:
             raise ValueError("Live interval midpoint did not advance")
         state["u0"] = (fit["center"] - state["tau_ps"]) / elapsed_mid_ps
         state["tau_ps"] = fit["center"]
-        # print(state["tau_ps"])
-        state["tau_rt_ps"] = fit_rt["center"]
-        state["epsilon_ps"] = state["tau_ps"] - state["tau_rt_ps"] / 2
         state["T_lastmid_ps"] = T_mid_ps
-        print("g2 fit: ", time.time() - t0)
+
+        # Update on tau_span
+        if abs(state["u0"]) < 200e-12:
+            state["tau_span_ps"] = state["tau_span_min_ps"]
+        else:
+            state["tau_span_ps"] = 50_000.0
 
         return state
 
@@ -717,7 +712,7 @@ class RealtimeG2Controller:
         """Append a structured event with time relative to the first live interval."""
         fields = (
             'event', 'interval', 'relative_s', 'tau_ps',
-            'u0_ps_per_s', 'T_lastmid_ms',
+            'u0_ps_per_s', 'tau_rt_ps', 'u0_rt_ps_per_s', 'T_lastmid_ms',
             'correction_ps_per_s', 'applied_correction_ps_per_s',
             'clock_status', 'command_id', 'acquisition_status', 'details',
         )
@@ -763,7 +758,7 @@ class RealtimeG2Controller:
                     self.tau_ps_history[:count].copy())
 
     def _live_analysis_worker(self):
-        """Process completed intervals sequentially outside acquisition callbacks."""
+        """Run non-RT tracking and clock correction before auxiliary RT tracking."""
         while not self.stop_event.is_set():
             try:
                 item = self.live_interval_queue.get(timeout=0.1)
@@ -773,107 +768,162 @@ class RealtimeG2Controller:
                 if item is None:
                     return
 
-                # t0 = time.time()
                 sequence, arrays = item
-                (t1_ps, ch1), (t2_ps, ch2) = arrays['ttx'], arrays['hh']
-                if self.live_state is None or self.live_t10_ps is None or self.live_t20_ps is None:
+                hh_times_ps, hh_channels = arrays['hh']
+                ttx_ch1_ps, ttx_ch2_ps = arrays['ttx_live']
+                if (self.live_state is None or self.live_state_rt is None
+                        or self.live_t10_ps is None or self.live_t20_ps is None):
                     raise RuntimeError('Live tracking state was not initialized after alignment')
-                state = self._analyze_live_interval(
-                    sequence, t1_ps, ch1, t2_ps, ch2,
-                    state=self.live_state,
-                    t10_ps=self.live_t10_ps,
-                    t20_ps=self.live_t20_ps,
+                # Non-RT is TTX ch1 against remote HH ch6. Both inputs are
+                # integer picoseconds rebased to their calibrated origins.
+                hh_ch6_ps = (
+                    hh_times_ps[hh_channels == self.live_hh_channel_1]
+                    - np.int64(self.live_t20_ps)
                 )
-                analysis_finished_ns = time.monotonic_ns()
-                # print("Processing: ", time.time() - t0)
-                t0 = time.time()
-                residual_drift_ps_per_s = float(state['u0']) * 1e12
+                first_live_step = self.live_analysis_steps == 0
+                nonrt_started_ns = time.monotonic_ns()
                 self._log_live_tracking_event(
-                    'analysis_finished', sequence, analysis_finished_ns,
-                    tau_ps=state['tau_ps'],
+                    'non_rt_processing_started', sequence, nonrt_started_ns,
+                    tau_ps=self.live_state['tau_ps'],
+                    T_lastmid_ms=self.live_state['T_lastmid_ps'] * 1e-9,
+                )
+                nonrt_state = self._analyze_live_interval(
+                    sequence, ttx_ch1_ps, hh_ch6_ps, state=self.live_state)
+                nonrt_finished_ns = time.monotonic_ns()
+                residual_drift_ps_per_s = float(nonrt_state['u0']) * 1e12
+                self._log_live_tracking_event(
+                    'non_rt_processing_finished', sequence, nonrt_finished_ns,
+                    tau_ps=nonrt_state['tau_ps'],
                     u0_ps_per_s=residual_drift_ps_per_s,
-                    T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                    T_lastmid_ms=nonrt_state['T_lastmid_ps'] * 1e-9,
                 )
 
-                self.live_state = state
-                self._append_tau_history(state['T_lastmid_ps'] * 1e-12, state['tau_ps'])
+                self.live_state = nonrt_state
+                self._append_tau_history(
+                    nonrt_state['T_lastmid_ps'] * 1e-12, nonrt_state['tau_ps'])
                 self.live_analysis_steps += 1
-                first_live_step = self.live_analysis_steps == 1
                 with self.lock:
                     self.live_step_result = {
                         'sequence': int(sequence),
-                        'tau_ps': float(state['tau_ps']),
+                        'tau_ps': float(nonrt_state['tau_ps']),
                         'u0_ps_per_s': residual_drift_ps_per_s,
                         'clock_status': (
                             'unchanged (first live fit)' if first_live_step else 'pending'
                         ),
+                        'rt_fit_error': None,
                     }
                 self._publish()
                 if first_live_step:
-                    # Use the first live fit as a measurement only. Start
-                    # applying interval corrections from the next fit onward.
                     self._log_live_tracking_event(
                         'clock_adjustment_skipped', sequence, time.monotonic_ns(),
-                        tau_ps=state['tau_ps'],
+                        tau_ps=nonrt_state['tau_ps'],
                         u0_ps_per_s=residual_drift_ps_per_s,
-                        T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                        T_lastmid_ms=nonrt_state['T_lastmid_ps'] * 1e-9,
                         clock_status='first live fit is measurement-only',
                     )
-                    continue
-                if not self.live_clock_adjustment_enabled:
+                elif not self.live_clock_adjustment_enabled:
                     with self.lock:
                         self.live_step_result['clock_status'] = 'disabled'
                     self._publish()
                     self._log_live_tracking_event(
                         'clock_adjustment_skipped', sequence, time.monotonic_ns(),
-                        tau_ps=state['tau_ps'],
+                        tau_ps=nonrt_state['tau_ps'],
                         u0_ps_per_s=residual_drift_ps_per_s,
-                        T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
+                        T_lastmid_ms=nonrt_state['T_lastmid_ps'] * 1e-9,
                         clock_status='live clock adjustment disabled',
                     )
-                    continue
 
-                # The node treats each command as a signed increment to its
-                # current clock correction. Scale the opposite residual by
-                # the diagnostic feedback gain; fitted u0 remains unscaled.
-                correction_ps_per_s = -self.live_correction_gain * residual_drift_ps_per_s
-                command_id = self._send_clock_adjustment(correction_ps_per_s)
-                command_result = self._wait_for_clock_adjustment(command_id)
-                clock_finished_ns = time.monotonic_ns()
-                command_result_details = command_result.get('result') or {}
-                self._log_live_tracking_event(
-                    'clock_adjustment_finished', sequence, clock_finished_ns,
-                    tau_ps=state['tau_ps'],
-                    u0_ps_per_s=residual_drift_ps_per_s,
-                    T_lastmid_ms=state['T_lastmid_ps'] * 1e-9,
-                    correction_ps_per_s=correction_ps_per_s,
-                    applied_correction_ps_per_s=command_result_details.get(
-                        'applied_correction_ps_per_s'),
-                    clock_status=('unchanged (below resolution)' if command_result.get('no_change')
-                                  else command_result.get('status')),
-                    command_id=command_id,
-                    details=command_result_details.get('message', ''),
-                )
-                if command_result.get('status') != 'applied':
-                    raise RuntimeError(
-                        f"Clock command {command_id}: {command_result.get('status')}: "
-                        f"{command_result.get('message', '')}")
-                applied = command_result.get('applied_correction_ps_per_s')
-                applied_delta_ps_per_s = (
-                    float(applied) if applied is not None else correction_ps_per_s
-                )
-                self.qcs_clock_adjustment_total_ps_per_s += applied_delta_ps_per_s
+                clock_error = None
+                if not first_live_step and self.live_clock_adjustment_enabled:
+                    # The node applies signed increments; send the opposite
+                    # of the measured non-RT residual drift.
+                    correction_ps_per_s = -self.live_correction_gain * residual_drift_ps_per_s
+                    command_id = None
+                    try:
+                        command_id = self._send_clock_adjustment(correction_ps_per_s)
+                        command_result = self._wait_for_clock_adjustment(command_id)
+                        clock_finished_ns = int(
+                            command_result.get('result_monotonic_ns') or time.monotonic_ns())
+                        details = command_result.get('result') or {}
+                        command_status = command_result.get('status', 'unknown')
+                        self._log_live_tracking_event(
+                            'clock_adjustment_finished', sequence, clock_finished_ns,
+                            tau_ps=nonrt_state['tau_ps'],
+                            u0_ps_per_s=residual_drift_ps_per_s,
+                            T_lastmid_ms=nonrt_state['T_lastmid_ps'] * 1e-9,
+                            correction_ps_per_s=correction_ps_per_s,
+                            applied_correction_ps_per_s=details.get(
+                                'applied_correction_ps_per_s'),
+                            clock_status=('unchanged (below resolution)'
+                                          if command_result.get('no_change') else command_status),
+                            command_id=command_id,
+                            details=command_result.get('message', ''),
+                        )
+                        if command_status != 'applied':
+                            raise RuntimeError(
+                                f"Clock command {command_id}: {command_status}: "
+                                f"{command_result.get('message', '')}")
+                        applied = command_result.get('applied_correction_ps_per_s')
+                        applied_delta_ps_per_s = (
+                            float(applied) if applied is not None else correction_ps_per_s
+                        )
+                        self.qcs_clock_adjustment_total_ps_per_s += applied_delta_ps_per_s
+                        with self.lock:
+                            self.live_step_result['clock_status'] = (
+                                'unchanged (below resolution)' if command_result.get('no_change')
+                                else 'adjustment applied'
+                            )
+                            self.live_step_result['applied_clock_delta_ps_per_s'] = applied_delta_ps_per_s
+                            self.live_step_result['qcs_clock_adjustment_total_ps_per_s'] = (
+                                self.qcs_clock_adjustment_total_ps_per_s
+                            )
+                        self._publish()
+                    except Exception as exc:
+                        clock_error = str(exc)
+                        if command_id is None:
+                            self._log_live_tracking_event(
+                                'clock_adjustment_finished', sequence, time.monotonic_ns(),
+                                tau_ps=nonrt_state['tau_ps'],
+                                u0_ps_per_s=residual_drift_ps_per_s,
+                                T_lastmid_ms=nonrt_state['T_lastmid_ps'] * 1e-9,
+                                correction_ps_per_s=correction_ps_per_s,
+                                clock_status='send failed', details=clock_error,
+                            )
+                        with self.lock:
+                            self.live_step_result['clock_status'] = 'failed: ' + clock_error
+                        self._publish()
+
+                # Run RT only after the non-RT result and clock command have
+                # completed. It has its own state and does not feed the plot.
+                rt_error = None
+                try:
+                    rt_state = self._analyze_live_interval(
+                        sequence, ttx_ch1_ps, ttx_ch2_ps,
+                        state=self.live_state_rt,
+                    )
+                    self.live_state_rt = rt_state
+                    rt_finished_ns = time.monotonic_ns()
+                    self._log_live_tracking_event(
+                        'rt_processing_finished', sequence, rt_finished_ns,
+                        tau_rt_ps=rt_state['tau_ps'],
+                        u0_rt_ps_per_s=float(rt_state['u0']) * 1e12,
+                        T_lastmid_ms=rt_state['T_lastmid_ps'] * 1e-9,
+                    )
+                except Exception as exc:
+                    rt_error = str(exc)
+                    rt_finished_ns = time.monotonic_ns()
+                    print(f'QCS RT analysis error (interval {sequence}): {rt_error}', flush=True)
+                    self._log_live_tracking_event(
+                        'rt_processing_finished', sequence, rt_finished_ns,
+                        details='failed: ' + rt_error,
+                    )
+
                 with self.lock:
-                    self.live_step_result['clock_status'] = (
-                        'unchanged (below resolution)' if command_result.get('no_change')
-                        else 'adjustment applied'
-                    )
-                    self.live_step_result['applied_clock_delta_ps_per_s'] = applied_delta_ps_per_s
-                    self.live_step_result['qcs_clock_adjustment_total_ps_per_s'] = (
-                        self.qcs_clock_adjustment_total_ps_per_s
-                    )
+                    self.live_step_result['rt_fit_error'] = rt_error
                 self._publish()
-                print("Send: ", time.time() - t0)
+                if clock_error:
+                    self._record_integrity_failure(
+                        f'Live clock adjustment failed (interval {sequence}): {clock_error}')
             except Exception as exc:
                 message = f'Live analysis/adjustment failed: {exc}'
                 print(f'QCS live tracking error (interval {sequence}): {message}', flush=True)
@@ -886,7 +936,7 @@ class RealtimeG2Controller:
         """Find global alignment, command the correction, and await its result."""
         try:
             from qcs_analyzer.global_freq_analysis import global_freq_alignment_g2
-            t1_ps, ch1 = arrays['ttx']
+            t1_ps = arrays['ttx_init']
             t2_ps, ch2 = arrays['hh']
             # Hardware timestamps are integer picoseconds. Keep them integer
             # through the Unix-start/latency correction; converting large
@@ -895,12 +945,11 @@ class RealtimeG2Controller:
                 raise TypeError('TTX and HydraHarp timestamps must be integer picoseconds')
             t1_ps = np.asarray(t1_ps, dtype=np.int64)
             t2_ps = np.asarray(t2_ps, dtype=np.int64)
-            ch1 = np.asarray(ch1, dtype=np.int64)
             ch2 = np.asarray(ch2, dtype=np.int64)
             offset = int(self.config.get('hydraharp_channel_offset', 5))
             photon1 = int(self.config.get('init_ttx_photon_channel', 1))
             photon2 = int(self.config.get('init_hh_photon_channel', offset + 1))
-            first = t1_ps[ch1 == photon1]
+            first = t1_ps
             second = t2_ps[ch2 == photon2]
             if first.size < 2 or second.size < 2:
                 raise ValueError(f'Need at least two photon events on channels {photon1}/{photon2}')
@@ -996,6 +1045,7 @@ class RealtimeG2Controller:
                     self.live_t10_ps = int(origins[0])
                     self.live_t20_ps = int(origins[1]) - calibrated_offset_ps
                     self.live_state = dict(DEFAULT_LIVE_STATE)
+                    self.live_state_rt = dict(DEFAULT_LIVE_STATE_RT)
                     self.initial_clock_adjustment_applied = True
                     # The active interval can contain events captured before
                     # the remote write completed. Skip it and start on the

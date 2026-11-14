@@ -1,0 +1,19 @@
+event,interval,relative_s,tau_ps,u0_ps_per_s,T_lastmid_ms,correction_ps_per_s,applied_correction_ps_per_s,clock_status,command_id,acquisition_status,details
+acquisition_finished,3,0.000000000,,,,,,,,checks passed,
+analysis_finished,3,0.998678939,57.77479993849448,12.065505671251579,4788.427564719001,,,,,,
+clock_adjustment_skipped,3,1.000191992,57.77479993849448,12.065505671251579,4788.427564719001,,,first live fit is measurement-only,,,
+acquisition_finished,4,2.011245734,,,,,,,,checks passed,
+analysis_finished,4,2.218613061,61.05940290731064,1.5571722036171323,6897.765864739001,,,,,,
+clock_adjustment_finished,4,2.223410073,61.05940290731064,1.5571722036171323,6897.765864739001,-0.15571722036171323,0.0,unchanged (below resolution),8bd2d6017d0b4803af556a7da5801e78,,Correction was below the divider resolution; numerator remained unchanged and no write was sent.
+acquisition_finished,5,4.001696190,,,,,,,,checks passed,
+analysis_finished,5,4.230904042,68.36358297992885,3.6166589104442877,8917.3591560845,,,,,,
+clock_adjustment_finished,5,4.316581949,68.36358297992885,3.6166589104442877,8917.3591560845,-0.3616658910444288,-0.35185017316710643,applied,c1fa74b3ae674660baa7d4dc59408666,,Numerator burst and update strobe completed in 0.071 s; post-adjustment readback was not performed.
+acquisition_finished,6,5.998277441,,,,,,,,checks passed,
+analysis_finished,6,6.193366293,65.07068341645362,-1.6625685984790226,10897.968898436,,,,,,
+clock_adjustment_finished,6,6.207419505,65.07068341645362,-1.6625685984790226,10897.968898436,0.16625685984790228,0.0,unchanged (below resolution),6ba47a3924a34b11b18a8be983cba352,,Correction was below the divider resolution; numerator remained unchanged and no write was sent.
+acquisition_finished,7,8.006226756,,,,,,,,checks passed,
+analysis_finished,7,8.188033236,71.29328519996943,3.109856502442544,12898.897809023501,,,,,,
+clock_adjustment_finished,7,8.267681320,71.29328519996943,3.109856502442544,12898.897809023501,-0.31098565024425445,-0.35188786315365483,applied,0722e02b7b424d1cba5115baa5c239fa,,Numerator burst and update strobe completed in 0.075 s; post-adjustment readback was not performed.
+acquisition_finished,8,10.000100535,,,,,,,,checks passed,
+analysis_finished,8,10.205324159,87.17285166901095,7.93756595299403,14899.456489490502,,,,,,
+clock_adjustment_finished,8,10.262456769,87.17285166901095,7.93756595299403,14899.456489490502,-0.793756595299403,-0.7036818973314707,applied,7bae1b5dff414e31b4524c54ab7e388e,,Numerator burst and update strobe completed in 0.052 s; post-adjustment readback was not performed.

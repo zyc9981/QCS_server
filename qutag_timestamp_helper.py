@@ -806,11 +806,16 @@ def _poll_qcs_once(app):
             app.qcs_initialization_var.set(initialization_status)
             live_step = update.get('live_step_result')
             if live_step is not None:
+                rt_status = (
+                    f" | RT fit failed: {live_step['rt_fit_error']}"
+                    if live_step.get('rt_fit_error') else ''
+                )
                 app.qcs_quality_var.set(
                     f"Interval {live_step['sequence']} | "
                     f"u0 {live_step['u0_ps_per_s']:+.3f} ps/s | "
                     f"time offset {live_step['tau_ps']:+.3f} ps | "
                     f"clock {live_step['clock_status']}"
+                    f"{rt_status}"
                 )
             if update.get('integrity_failure'):
                 app.qcs_quality_var.set('Acquisition integrity failure: ' + update['integrity_failure'])
